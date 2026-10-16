@@ -73,10 +73,6 @@ constexpr uint16_t kPropTypeObject = 0x000D;
 // libpff format notes (see THIRD_PARTY_NOTICES.txt):2491-2509.
 constexpr uint16_t kTagAttachMethod = 0x3705;
 constexpr uint32_t kAttachMethodMessage = 5;
-// [MS-PST] 2.3.4.4.2 (docs/reference/ms-pst.txt:3084-3110): a Row Matrix row holds a fixed value of
-// 8 bytes or less inline; a variable-sized type and any fixed type over 8 bytes is a 4-byte HNID
-// slot instead.
-constexpr uint64_t kTcInlineMaxFixedBytes = 8;
 constexpr uint64_t kTcHnidSlotBytes =
     4; // [MS-PST] 2.3.4.4.2: the HNID slot a variable-sized column leaves
 // [MS-PST] 2.4.3.2 and DEVELOPMENT.md D7: EntryIDs are regenerated against the new Provider
@@ -364,17 +360,30 @@ SubsetValue pc_record_value(Ctx& ctx, const ltp::PcRecord& record, ltp::NodeValu
     return out;
 }
 
-// Reads one node's Property Context and resolves every record it holds. `resolve_payload` is off
-// only for a caller that wants the property list without pulling megabytes of attachment data
-// through the blocks.
+// Diagnostic BTH walks can tolerate damaged entries; conversion must not claim that
+// the successfully visited subset establishes complete property/row populations.
+Status complete_bth(const ltp::BthStats& stats, const char* field, uint64_t offset) {
+    if (stats.skipped_records || stats.trailing_bytes || stats.stopped_early)
+        return util::make_error(
+            stats.stopped_early ? util::ErrorKind::kUnsupported : util::ErrorKind::kBadField, field,
+            offset, stats.skipped_records,
+            "incomplete BTH: skipped records=" + std::to_string(stats.skipped_records) +
+                ", trailing bytes=" + std::to_string(stats.trailing_bytes) +
+                ", stopped early=" + (stats.stopped_early ? "true" : "false"));
+    return {};
+}
+
+// Reads every property. `resolve_payload` is off only when the caller wants the
+// property list without pulling attachment data through the blocks.
 bool read_property_values(Ctx& ctx, uint64_t nid, uint64_t bid_sub, ltp::NodeHeap& heap_node,
-                          std::vector<SubsetValue>& values, bool resolve_payload) {
+                          std::vector<SubsetValue>& values, bool resolve_payload,
+                          std::string& note) {
     if (heap_node.source == nullptr) {
         return false;
     }
     std::vector<ltp::PcRecord> records;
     ltp::BthStats stats;
-    const Status walked = ltp::read_pc(
+    Status walked = ltp::read_pc(
         heap_node.header, ctx.census.profile, *heap_node.source,
         [&](const ltp::PcRecord& record) {
             if (!ctx.reserve(4 * sizeof(ltp::PcRecord), "subset.pc_workspace"))
@@ -383,10 +392,14 @@ bool read_property_values(Ctx& ctx, uint64_t nid, uint64_t bid_sub, ltp::NodeHea
             return true;
         },
         stats, ctx.failures);
+    if (walked.ok())
+        walked = complete_bth(stats, "PC.BTH.complete", heap_node.ib);
     if (!walked.ok()) {
         ctx.error(walked.error());
-        ctx.note("0x" + hex_u64(nid) +
-                 ": Property Context did not read: " + util::format_error(walked.error()));
+        const std::string detail =
+            "Property Context did not read: " + util::format_error(walked.error());
+        append_note(note, detail);
+        ctx.note("0x" + hex_u64(nid) + ": " + detail);
         return false;
     }
     ltp::NodeValueSource source(*heap_node.source, bid_sub, ctx.census.profile, ctx.blocks,
@@ -440,13 +453,12 @@ struct TableStats {
     uint64_t matrix_blocks = 0;
     uint64_t matrix_short_blocks =
         0; // nonfinal blocks that are not a full block ([MS-PST] 2.3.4.4)
-    bool row_index_stopped_early = false;
     std::string note;
 };
 
 // One cell of one row. [MS-PST] 2.3.4.4.2 decides whether the slot IS the value or names it: a
-// fixed type of 8 bytes or less is inline, and a variable-sized type or a fixed type over 8 bytes
-// leaves a 4-byte HNID that has to be answered through the TC node's own heap and subnodes.
+// single-valued fixed type of 8 bytes or less is inline. All other types, including
+// multi-valued fixed-base arrays, leave a 4-byte HNID into the TC's heap or subnodes.
 SubsetValue tc_cell_value(Ctx& ctx, const ltp::TcColumn& column, ByteView cell,
                           ltp::NodeValueSource& values) {
     SubsetValue out;
@@ -465,8 +477,7 @@ SubsetValue tc_cell_value(Ctx& ctx, const ltp::TcColumn& column, ByteView cell,
     if (out.prop_id == kTagLtpRowId || out.prop_id == kTagLtpRowVer) {
         out.writer_assigned = true;
     }
-    const ltp::PropTypeInfo type = ltp::prop_type_info(out.prop_type);
-    if (!type.variable_size && type.fixed_size <= kTcInlineMaxFixedBytes) {
+    if (ltp::prop_type_is_tc_inline(out.prop_type)) {
         out.bytes.assign(cell.data(), cell.data() + cell.size());
         out.readable = true;
         if (out.bytes.size() == 4) {
@@ -534,7 +545,7 @@ bool read_table_rows(Ctx& ctx, uint64_t table_nid, uint64_t bid_data, uint64_t b
 
     ltp::BthStats bth;
     std::vector<ltp::TcRowId> row_index;
-    const Status walked = ltp::walk_tc_row_index(
+    Status walked = ltp::walk_tc_row_index(
         info, ctx.census.profile, *table.source,
         [&](const ltp::TcRowId& row) {
             if (!ctx.reserve(
@@ -545,7 +556,10 @@ bool read_table_rows(Ctx& ctx, uint64_t table_nid, uint64_t bid_data, uint64_t b
             return true;
         },
         bth, ctx.failures);
+    if (walked.ok())
+        walked = complete_bth(bth, "TC.RowIndex.complete", info.header_offset);
     if (!walked.ok()) {
+        ++ctx.report.row_index_walks_incomplete;
         ctx.error(walked.error());
         stats.note = "RowIndex BTH did not walk: " + util::format_error(walked.error());
         return false;
@@ -654,10 +668,6 @@ bool read_table_rows(Ctx& ctx, uint64_t table_nid, uint64_t bid_data, uint64_t b
         stats.column_values.push_back(std::move(definition));
     }
     stats.rows = row_index.size();
-    stats.row_index_stopped_early = bth.stopped_early;
-    if (bth.stopped_early) {
-        ++ctx.report.row_index_walks_incomplete;
-    }
 
     ltp::NodeValueSource values(*table.source, bid_sub, ctx.census.profile, ctx.blocks,
                                 ctx.subnodes, ctx.trees, ctx.failures);
@@ -697,6 +707,9 @@ bool read_table_rows(Ctx& ctx, uint64_t table_nid, uint64_t bid_data, uint64_t b
             const Result<ltp::TcCell> cell = ltp::tc_column_cell(info, column, row_bytes);
             if (!cell.ok()) {
                 ctx.error(cell.error());
+                out.cells_read = false;
+                ++stats.rows_without_cells;
+                ++ctx.report.rows_without_cells;
                 out.note = "column 0x" + hex_u32(column.tag) +
                            " did not read: " + util::format_error(cell.error());
                 break;
@@ -905,8 +918,8 @@ void build_message(Ctx& ctx, const ltp::NodeRef& node, SubsetMessage& message, u
                        ltp::client_sig_name(heap_node.header.b_client_sig) + ")";
         return;
     }
-    message.pc_read =
-        read_property_values(ctx, node.nid, node.bid_sub, heap_node, message.values, true);
+    message.pc_read = read_property_values(ctx, node.nid, node.bid_sub, heap_node, message.values,
+                                           true, message.note);
 
     if (message.pc_read) {
         const auto has_tag = [&](uint16_t prop_id) {
@@ -1056,9 +1069,9 @@ void build_message(Ctx& ctx, const ltp::NodeRef& node, SubsetMessage& message, u
                 message.attachments.push_back(std::move(attachment));
                 continue;
             }
-            attachment.pc_read =
-                read_property_values(ctx, match->nid, match->bid_sub, attachment_node,
-                                     attachment.values, ctx.options.collect_payloads);
+            attachment.pc_read = read_property_values(
+                ctx, match->nid, match->bid_sub, attachment_node, attachment.values,
+                ctx.options.collect_payloads, attachment.note);
             if (!attachment.pc_read) {
                 append_note(attachment.note, "the Attachment object Property Context did not read");
                 ++ctx.report.attachment_pc_failures;
@@ -1190,8 +1203,8 @@ void build_folder(Ctx& ctx, const ltp::NodeRef& node, SubsetFolder& folder) {
         folder.note = "the Folder object did not open as a Property Context";
         return;
     }
-    folder.pc_read =
-        read_property_values(ctx, node.nid, node.bid_sub, heap_node, folder.values, true);
+    folder.pc_read = read_property_values(ctx, node.nid, node.bid_sub, heap_node, folder.values,
+                                          true, folder.note);
     for (const SubsetValue& value : folder.values) {
         if (value.prop_id == kTagDisplayName && value.readable) {
             if (value.source) {

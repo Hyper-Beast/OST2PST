@@ -6,7 +6,6 @@ namespace ost2pst::ltp {
 
 PropTypeInfo prop_type_info(uint16_t prop_type) {
     // [MS-OXCDATA] 2.11.1: the multi-valued forms share the base type's id with the 0x1000 flag set.
-    const bool multi_valued = (prop_type & kPropTypeMultiValuedFlag) != 0;
     const uint16_t base = static_cast<uint16_t>(prop_type & ~kPropTypeMultiValuedFlag);
     switch (base) {
     case 0x0000:
@@ -54,6 +53,13 @@ bool prop_type_is_inline(uint16_t prop_type) {
     const PropTypeInfo info = prop_type_info(prop_type);
     // [MS-PST] 2.3.3.3: fixed data size <= 4 bytes means dwValueHnid is the value itself.
     return !info.variable_size && info.fixed_size >= 1 && info.fixed_size <= kPcValueInlineMax;
+}
+
+bool prop_type_is_tc_inline(uint16_t prop_type) {
+    if ((prop_type & kPropTypeMultiValuedFlag) != 0)
+        return false;
+    const PropTypeInfo info = prop_type_info(prop_type);
+    return !info.variable_size && info.fixed_size >= 1 && info.fixed_size <= 8;
 }
 
 } // namespace ost2pst::ltp

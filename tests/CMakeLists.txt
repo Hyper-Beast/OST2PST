@@ -58,6 +58,9 @@ ost2pst_add_unit_test(msg_inventory_test ost2pst_msg)
 ost2pst_add_unit_test(msg_subset_test ost2pst_msg)
 ost2pst_add_unit_test(msg_mailbox_test ost2pst_msg)
 ost2pst_add_unit_test(msg_outcome_test ost2pst_msg)
+ost2pst_add_unit_test(conversion_regressions_test ost2pst_msg)
+# Includes a synthetic BBT just above the former 128 MiB ceiling.
+set_tests_properties(conversion_regressions_test PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 
 # M4: the writer's own components, each checked through the reader that has to accept its bytes.
 ost2pst_add_unit_test(writer_heap_test ost2pst_writer)

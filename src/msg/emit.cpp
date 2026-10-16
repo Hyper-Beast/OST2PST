@@ -366,7 +366,7 @@ ContentMessage emit_message(Emitter& emitter, const SubsetMessage& message) {
                                                          out.attachments, attach_context));
         ContentAttachment object;
         for (const SubsetValue& value : attachment.values) {
-            if (value.prop_id == kTagAttachData) {
+            if (value.prop_id == kTagAttachData && !value.absent) {
                 // Payloads bypass carry(), but a failed value read must still reach the verdict.
                 // Named objects use the separate embedded-object completeness checks.
                 if (!value.readable && !value.absent && !value.object_named) {
@@ -377,6 +377,8 @@ ContentMessage emit_message(Emitter& emitter, const SubsetMessage& message) {
                 continue; // the payload goes over as 0x3701 ([MS-PST] 2.4.6.2.2), not as a PC
                           // record
             }
+            // HNID 0 is a present-empty property. Preserve its original type in the PC,
+            // even though there is no payload to send through the attachment byte path.
             ContentProperty property;
             if (!emitter.carry(value, attach_context, property)) {
                 continue;

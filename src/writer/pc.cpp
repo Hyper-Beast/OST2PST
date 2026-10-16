@@ -122,19 +122,25 @@ Result<PcNode> build_pc(const std::vector<PcProperty>& properties, LocalNids& lo
     bth_header[ltp::kBthTypeOffset] = ltp::kBthType;
     bth_header[ltp::kBthCbKeyOffset] = ltp::kPcCbKey;
     bth_header[ltp::kBthCbEntOffset] = ltp::kPcCbEnt;
-    bth_header[ltp::kBthIdxLevelsOffset] =
-        0; // [MS-PST] 2.3.2.1: a PC this size needs no index level
+    bth_header[ltp::kBthIdxLevelsOffset] = 0; // Patched when index levels are needed.
     // hidRoot stays 0 for now: patched below, and left 0 for an empty PC ([MS-PST] 2.3.2.1).
     Result<uint32_t> appended = node.heap.append(std::move(bth_header));
     if (!appended.ok()) {
         return appended.error();
     }
 
-    uint64_t records_allocation = 0;
-    if (!sorted.empty()) {
-        std::vector<uint8_t> records(sorted.size() * ltp::kPcRecordSize, 0);
-        for (size_t index = 0; index < sorted.size(); ++index) {
-            const uint64_t at = index * ltp::kPcRecordSize;
+    // [MS-PST] 2.6.2.1.2 limits each heap allocation to 3580 bytes. Split the PC
+    // into BTH leaves, then index their first keys ([MS-PST] 2.3.2.2 / 2.3.2.3).
+    constexpr size_t leaf_capacity = ltp::kPcHeapValueMax / ltp::kPcRecordSize;
+    constexpr size_t index_record_size = ltp::kPcCbKey + ltp::kBthHidNextLevelSize;
+    constexpr size_t index_capacity = ltp::kPcHeapValueMax / index_record_size;
+    std::vector<uint64_t> record_allocations;
+    std::vector<std::pair<uint16_t, uint32_t>> level;
+    for (size_t first = 0; first < sorted.size(); first += leaf_capacity) {
+        const size_t end = std::min(sorted.size(), first + leaf_capacity);
+        std::vector<uint8_t> records((end - first) * ltp::kPcRecordSize, 0);
+        for (size_t index = first; index < end; ++index) {
+            const uint64_t at = (index - first) * ltp::kPcRecordSize;
             put_u16(records, at + ltp::kPcPropIdOffset, sorted[index].prop_id);
             put_u16(records, at + ltp::kPcPropTypeOffset, sorted[index].prop_type);
             put_u32(records, at + ltp::kPcValueHnidOffset, value_hnid[index]);
@@ -143,7 +149,27 @@ Result<PcNode> build_pc(const std::vector<PcProperty>& properties, LocalNids& lo
         if (!appended.ok()) {
             return appended.error();
         }
-        records_allocation = node.heap.allocation_count();
+        record_allocations.push_back(node.heap.allocation_count());
+        level.emplace_back(sorted[first].prop_id, appended.value());
+    }
+    uint8_t index_levels = 0;
+    while (level.size() > 1) {
+        std::vector<std::pair<uint16_t, uint32_t>> next;
+        for (size_t first = 0; first < level.size(); first += index_capacity) {
+            const size_t end = std::min(level.size(), first + index_capacity);
+            std::vector<uint8_t> records((end - first) * index_record_size, 0);
+            for (size_t index = first; index < end; ++index) {
+                const size_t at = (index - first) * index_record_size;
+                put_u16(records, at, level[index].first);
+                put_u32(records, at + ltp::kPcCbKey, level[index].second);
+            }
+            appended = node.heap.append(std::move(records));
+            if (!appended.ok())
+                return appended.error();
+            next.emplace_back(level[first].first, appended.value());
+        }
+        level = std::move(next);
+        ++index_levels;
     }
 
     // The variable-size values that stayed in the heap follow the record array ([MS-PST] 2.3.3.2).
@@ -159,16 +185,21 @@ Result<PcNode> build_pc(const std::vector<PcProperty>& properties, LocalNids& lo
         heap_values.emplace_back(index, node.heap.allocation_count());
     }
 
-    // Every HID the PC names now exists, so the two allocations that name others can carry them.
+    // Every HID now exists; patch the root and each value's own leaf slot.
     if (!sorted.empty()) {
-        Status root = node.heap.patch(1, ltp::kBthHidRootOffset, node.heap.hid(records_allocation));
+        Status root = node.heap.patch(1, ltp::kBthHidRootOffset, level.front().second);
         if (!root.ok()) {
             return root.error();
         }
+        Status depth =
+            node.heap.patch(1, ltp::kBthIdxLevelsOffset, std::vector<uint8_t>{index_levels});
+        if (!depth.ok())
+            return depth.error();
         for (const std::pair<size_t, uint64_t>& placed : heap_values) {
-            Status patched = node.heap.patch(
-                records_allocation, placed.first * ltp::kPcRecordSize + ltp::kPcValueHnidOffset,
-                node.heap.hid(placed.second));
+            Status patched = node.heap.patch(record_allocations[placed.first / leaf_capacity],
+                                             (placed.first % leaf_capacity) * ltp::kPcRecordSize +
+                                                 ltp::kPcValueHnidOffset,
+                                             node.heap.hid(placed.second));
             if (!patched.ok()) {
                 return patched.error();
             }

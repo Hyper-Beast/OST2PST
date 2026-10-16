@@ -49,12 +49,10 @@ struct Column {
     bool placed = false;    // true for the two columns whose ibData [MS-PST] 2.3.4.4.1 fixes
 };
 
-// [MS-PST] 2.3.4.4.2: a TC keeps a value in the row when the type is fixed-size and 8 bytes or
-// less; a variable-sized type, and any fixed type wider than 8 bytes, is stored behind an HNID that
-// takes the 4-byte rgdwData slot instead.
+// [MS-PST] 2.3.4.4.2: only single-valued fixed types up to 8 bytes live in the row.
+// All other types, including every multi-valued type, use a 4-byte HNID slot.
 bool value_lives_in_the_heap(uint32_t tag) {
-    const ltp::PropTypeInfo info = ltp::prop_type_info(ltp::tc_prop_type_of_tag(tag));
-    return info.variable_size || info.fixed_size > kTcInlineMaxFixedBytes;
+    return !ltp::prop_type_is_tc_inline(ltp::tc_prop_type_of_tag(tag));
 }
 
 uint64_t column_width(uint32_t tag) {

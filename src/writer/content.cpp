@@ -764,9 +764,8 @@ Result<std::vector<TcRow>> content_rows(const TableColumns& columns,
             table_row.sources[column] = cell.source;
             // Only a column the row reaches through an HNID can say "exists with no value" (HNID
             // 0); an inline column has no room for that distinction ([MS-PST] 2.3.4.4.2).
-            const ltp::PropTypeInfo info = ltp::prop_type_info(tag_type(cell.tag));
             table_row.present_empty[column] =
-                cell.absent && (info.variable_size || info.fixed_size > kTcInlineMaxFixedBytes);
+                cell.absent && !ltp::prop_type_is_tc_inline(tag_type(cell.tag));
             ++builder.report.values_written;
         }
         out.push_back(std::move(table_row));
@@ -1321,9 +1320,7 @@ TcRow message_row(const MessageBuild& message, const std::vector<uint32_t>& tags
             } else if (!property.value.empty()) {
                 row.values[column] = row_cell_from_pc_value(type, property.value);
             } else {
-                const ltp::PropTypeInfo info = ltp::prop_type_info(type);
-                row.present_empty[column] =
-                    info.variable_size || info.fixed_size > kTcInlineMaxFixedBytes;
+                row.present_empty[column] = !ltp::prop_type_is_tc_inline(type);
             }
             ++builder.report.values_written;
             break;

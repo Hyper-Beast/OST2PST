@@ -219,6 +219,15 @@ meaning or three failed attempts. Preserve a minimal case; suspect the decoder b
 - Every source NBT entry gets a coverage record. Search exclusion, regenerated scaffold, unknown
   internal structures and content are explicit. Recognizing a template does not prove equivalence.
 - CEB-set non-inline HNID zero is a present empty value; unset CEB is absence. Preserve that distinction.
+- All multi-valued TC types use an HNID, including arrays of fixed-size numeric values
+  (MS-PST 2.3.4.4.2). Apply the same rule in extraction, column layout and empty-cell emission.
+  Present-empty Attachment PC property 0x3701 retains its type and HNID zero; it must not disappear
+  merely because there are no payload bytes.
+- A tolerant BTH walk is not proof of complete extraction: skipped records, trailing partial records
+  or an early stop invalidate the owning PC/TC. Carry the reason into the item diagnostic and
+  terminal outcome; resource ceilings remain unsupported, malformed content remains corrupt.
+- PC writers split sorted records into leaves of at most 3580 bytes and index their first keys
+  (MS-PST 2.3.2.2/2.3.2.3, 2.6.2.1.2). Property count alone must not force one oversized allocation.
 - Terminal outcomes are unique and committed; source/committed/verified populations reconcile.
   Source omissions, unsupported content, corrupt data and deliberate exclusions stay separate.
   Available body/attachment/recursive object bytes are compared, not replaced by guessed content.
@@ -248,6 +257,9 @@ The one-million-object/block ceiling still applies to each private record, indep
 whole output. Read-only diagnostics retain their separate 256 MiB workspace ceiling. Consult the
 owning headers for precise scopes. A resource limit must propagate as unsupported/incomplete,
 not corruption or success. ValueSpool budgets payload separately; nested metadata shares reservation.
+The manifest bounds its NBT copy/destination mapping to one million entries. It reuses the census
+BBT, whose memory was already budgeted by the reader; it must not impose the former second 128 MiB
+BBT ceiling. This does not remove the source/candidate index workspace limit.
 The extraction ceiling is cumulative allocation accounting, including conservative construction,
 copy and vector-growth multipliers, not live memory or RSS. It is charged on demand and resets
 for each top-level item; embedded messages share the parent's budget. The former 64 MiB default

@@ -28,4 +28,8 @@ PropTypeInfo prop_type_info(uint16_t prop_type);
 // multi-valued type is always stored through an HNID ([MS-PST] 2.3.3.4).
 bool prop_type_is_inline(uint16_t prop_type);
 
+// [MS-PST] 2.3.4.4.2: a TC stores single-valued fixed types up to 8 bytes inline;
+// all multi-valued types, including fixed-base arrays, are reached through an HNID.
+bool prop_type_is_tc_inline(uint16_t prop_type);
+
 } // namespace ost2pst::ltp

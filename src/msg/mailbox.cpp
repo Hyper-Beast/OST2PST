@@ -92,8 +92,9 @@ Result<MailboxManifest> build_mailbox_manifest(const ltp::LtpReadReport& census)
         return make_error(ErrorKind::kBadField, "mailbox.index", 0, census.nid_entries,
                           "BBT/NBT enumeration must be complete before allocating destination IDs");
     }
-    // Engineering metadata budget, not a PST layout limit. Refuse before duplicating the index.
-    if (census.nodes.size() > 1000000 || census.bbt_index.bytes() > 128 * 1024 * 1024)
+    // Bound the NBT copy and destination mapping. The BBT remains owned by the census;
+    // its workspace budget was already enforced by the source index reader.
+    if (census.nodes.size() > 1000000)
         return make_error(ErrorKind::kUnsupported, "mailbox.index_budget", 0, census.nodes.size());
     MailboxManifest out;
     auto names = registry(census, out.named_mapping);
