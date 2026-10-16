@@ -1,0 +1,6 @@
+#pragma once
+
+// Generated from tests/paths.h.in by CMake. Tests read fixtures by absolute path so they run from
+// any working directory and never depend on the 2.6 GB sample.
+#define OST2PST_FIXTURE_DIR "@OST2PST_FIXTURE_DIR@"
+#define OST2PST_GOLDEN_DIR "@OST2PST_GOLDEN_DIR@"

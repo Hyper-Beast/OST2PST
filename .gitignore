@@ -1,0 +1,27 @@
+# Mailbox data and every conversion sidecar remain local.
+*.ost*
+*.pst*
+*.msg
+*.eml
+*.work/
+*.work.init-*/
+*.report.json
+*.items.jsonl
+*.complete.json
+*.export/
+samples/
+private/
+third_party/
+build*/
+cmake-build*/
+.vs/
+.idea/
+__pycache__/
+*.pyc
+*.exe
+*.dll
+*.obj
+*.lib
+*.pdb
+*.log
+*.zip

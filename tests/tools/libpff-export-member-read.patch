@@ -1,0 +1,22 @@
+--- a/third_party/libpff/pfftools/export_handle.c
++++ b/third_party/libpff/pfftools/export_handle.c
+@@ -10526 +10526,18 @@
+-/* TODO refactor to separate function */
++			if( libpff_multi_value_get_value_binary_data(
++			     multi_value,
++			     value_index,
++			     member_identifier_data,
++			     member_identifier_data_size,
++			     error ) != 1 )
++			{
++				libcerror_error_set(
++				 error,
++				 LIBCERROR_ERROR_DOMAIN_RUNTIME,
++				 LIBCERROR_RUNTIME_ERROR_GET_FAILED,
++				 "%s: unable to retrieve member one-off entry identifier: %d data.",
++				 function,
++				 value_index );
++
++				goto on_error;
++			}
++	/* TODO refactor to separate function */

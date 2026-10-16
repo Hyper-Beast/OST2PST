@@ -1,0 +1,60 @@
+OST2PST — license status and reference acknowledgements
+
+PROJECT LICENSE
+OST2PST's own code, documentation and original icon artwork are licensed under
+the MIT License. See LICENSE for the complete terms.
+Third-party materials described below retain their respective licenses. In
+particular, the optional libpff-export-member-read.patch is LGPL-3.0-or-later,
+not MIT. The project license does not replace upstream notices or license terms.
+
+RUNTIME
+The converter uses the C++ standard library, Microsoft compiler runtime and
+Windows system APIs. It does not link libpff, libpst, pstsdk or a third-party zlib
+library. DEFLATE/zlib-format inflation, CRC32 and SHA-256 are implemented in the
+project. Python's zlib module is used only by synthetic test/verification code.
+
+FORMAT REFERENCES AND PUBLIC EXAMPLES
+Microsoft [MS-PST]: Outlook Personal Folders (.pst) File Format, revision
+2025-02-18. Sections 3.2 and 3.8 supply the small public example byte sequences
+embedded in tests/tools/generate_fixtures.py; these are not mailbox samples.
+https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/
+Microsoft's Open Specifications copyright notice expressly permits distributing
+portions in implementations and related documentation; it is not a project
+license or a patent-license grant. The full reference document is not bundled.
+Copyright Microsoft Corporation. All rights reserved.
+
+Joachim Metz / libyal, Personal Folder File (PFF) format notes:
+https://github.com/libyal/libpff/blob/main/documentation/Personal%20Folder%20File%20(PFF)%20format.asciidoc
+Copyright (C) 2008-2020 Joachim Metz; document licensed under GNU FDL 1.3 or
+later, no invariant sections or cover texts. Consult the upstream license.
+The OST/PST reader uses this document as an implementation reference, particularly
+for Unicode 4 KiB-page OST structures. Selected libpff/libfmapi source constants
+and behavior were also consulted; relevant implementation comments cite them.
+Thanks to Joachim Metz and the libyal contributors for this work.
+The document is referenced, not bundled. Code comments cite technical sections;
+unknown fields in those notes remain unknown rather than normative guarantees.
+
+RFC 1950 (zlib), RFC 1951 (DEFLATE), RFC 6234 (SHA algorithms):
+https://www.rfc-editor.org/rfc/rfc1950
+https://www.rfc-editor.org/rfc/rfc1951
+https://www.rfc-editor.org/rfc/rfc6234
+Algorithm/constant references; the complete RFC texts and their reference code
+implementations are not bundled. No third-party hashing/inflate implementation
+is linked into the converter.
+
+OPTIONAL INDEPENDENT VERIFICATION
+libpff: https://github.com/libyal/libpff — Joachim Metz and contributors.
+The locally inspected libpff/pfftools source headers state LGPL 3 or later;
+the upstream repository also carries GPL/LGPL notices. Check the exact components
+and revision you build. Neither library source nor compiled library/tool binaries
+are distributed in this copy. tests/tools contains project-authored API probes.
+libpff-export-member-read.patch is the retained small change to upstream
+pfftools/export_handle.c used in the accepted external export comparison. It is
+a modification of LGPL-3.0-or-later code; retain that component's notices when
+applying/distributing it. The project's MIT license does not relicense this patch.
+The accompanying licenses/COPYING.txt and licenses/COPYING.LESSER.txt contain
+the full GNU GPL/LGPL 3 texts for that optional patch's upstream component.
+
+Build/test tools (not converter dependencies): CMake, Visual Studio/MSVC,
+Python 3 and Git Bash; optional ripgrep and clang-format. Their own licenses
+apply to those separately installed tools.
