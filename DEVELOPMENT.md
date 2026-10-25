@@ -250,23 +250,70 @@ acceptance remain unrecorded. Source review was by the implementing assistant.
 ### Bounded processing
 
 Engineering ceilings are not format layout constants or allocator/RSS guarantees. Full conversion
-uses an 8 GiB on-demand source/candidate index accounting ceiling, 512 MiB item/folder metadata,
-32 MiB record metadata, 1 GiB aggregate encoded assembly metadata, 32 million physical output blocks
-(including generated internal blocks), one million top-level output nodes and recursive depth 64.
-The one-million-object/block ceiling still applies to each private record, independently of the
-whole output. Read-only diagnostics retain their separate 256 MiB workspace ceiling. Consult the
-owning headers for precise scopes. A resource limit must propagate as unsupported/incomplete,
-not corruption or success. ValueSpool budgets payload separately; nested metadata shares reservation.
+selects a shared managed workspace from 10% of available physical RAM at startup, clamped to
+256 MiB..2 GiB (256 MiB on detection failure). Cooperative pressure checks, at most once per second
+on scratch writes, reduce the target when available RAM falls. A touched resident buffer then
+spills; the target can recover up to the original ceiling. Inactive buffers are not asynchronously
+evicted. These settings do not change persistent conversion identity or output geometry.
+
+`util::Workspace` owns the shared pool. `SpillBuffer` pages, payload/property spools, table scratch,
+encoded record metadata, aggregate block references and writer block descriptors use it. Folder
+summaries/row-reference vectors and retained assembly graphs hold conservative reservations until
+their owning states are released. Deduplication lookup memory is reserved too: its capacity is
+reduced to fit, or its lookup is discarded under graph pressure; exact unshared output remains
+valid. Releasing an allocation/source owner returns its lease, rather than treating all bytes ever
+processed as still resident.
+
+Scratch contents spill to exclusive delete-on-close files under the owned work directory. A
+spilled buffer uses at most one 64 KiB page cache if an allowance is available; zero-cache I/O is
+supported. Growth explicitly zeroes scratch file extensions. All reads/writes are checked, failures
+are sticky, and no error may turn into successful zero data. Sources keep scratch alive until
+staging has read them. Scratch files are not recovery authorities: only committed journal records
+are replayed. Existing flush/transaction ordering, source/binary binding and output protection stay
+in force. Low-memory operation trades extra temporary disk space and I/O for smaller resident caches.
+
+This is a managed-workspace allowance, **not a cap on process RSS**. Source/candidate BBT/NBT,
+manifest/outcome bookkeeping, transient parsed item graphs, allocator overhead, layout maps/pages,
+and fixed I/O/sort windows have separate bounds. In particular, source/candidate index accounting
+still caps at 8 GiB; item/folder extraction uses cumulative metadata accounting with conservative
+copy multipliers, at `max(512 MiB, selected workspace ceiling)`, capped at 2 GiB in automatic mode.
+Nested items share that extraction allowance. Very complex parsed content or retained graphs can
+still be refused as unsupported rather than growing memory without bounds. Read-only diagnostics
+retain their separate 256 MiB workspace ceiling. Do not describe any of these numbers as a strict
+whole-process memory guarantee.
+
+Output retains 32 million physical blocks (including generated internal blocks), one million
+top-level nodes and private-record objects/blocks, and recursive depth 64. Full conversion derives
+the journal record allowance from the manifest's items + folders + scaffold, with a 100,000 minimum
+and one-million maximum; it no longer always refuses at 100,000 records. Streaming record encoding
+and bounded-window decoding replace the 32 MiB resident-record/1 GiB aggregate-encoded-metadata
+refusals in full mode. The unchanged private framing still has a DWORD metadata length. Contents
+row values are returned as bounded journal-backed sources, so the journal must outlive those rows.
+Legacy in-memory adapters keep their 32 MiB/1 GiB accounting limits. Collection, framing, recursion,
+source completeness and format checks remain enforced. A resource refusal must propagate as
+unsupported/incomplete, never corruption or success.
 The manifest bounds its NBT copy/destination mapping to one million entries. It reuses the census
 BBT, whose memory was already budgeted by the reader; it must not impose the former second 128 MiB
 BBT ceiling. This does not remove the source/candidate index workspace limit.
-The extraction ceiling is cumulative allocation accounting, including conservative construction,
-copy and vector-growth multipliers, not live memory or RSS. It is charged on demand and resets
-for each top-level item; embedded messages share the parent's budget. The former 64 MiB default
-rejected valid recipient-heavy items. The 512 MiB default increases capacity without releasing
-reservations prematurely, retrying partial extraction, or relaxing content checks. Explicit smaller
-budgets still refuse with an unsupported outcome and no item plan. Budget diagnostics record used,
-limit and requested bytes. The limit is finite and does not guarantee every possible item fits.
+Full-mode table construction uses paged cell/row-key arrays, 4096-key sorted runs with merge passes,
+scratch-backed heap allocations and a streamed row matrix. Heap block images are emitted one at a
+time; matrix output retains whole-row block geometry and zero padding. The one-million-row ceiling
+remains. Unicode HID block-index capacity is checked before allocating another heap block; spill
+must never introduce HID wraparound. Legacy table adapters retain the 512 MiB cumulative accounting
+ceiling. `writer.tc.workspace` refers to that accounting, not a corrupt source offset or RSS.
+`writer_tc_test` compares every emitted heap block and matrix byte against a resident reference
+under a 1 MiB shared cache, exercises external-sort boundaries and processes ~143 MiB of heap values
+which exceed the former 512 MiB copy accounting. It also retains the 69,621-row and explicit refusal
+regressions. `writer_streaming_test` compares complete PST bytes across descriptor paging boundaries.
+`writer_staged_plan_test` streams/rereads a 40 MiB row value through metadata windows no larger than
+8192 bytes; `workspace_test` covers shared limits, pressure shrink, ownership, zero-cache I/O and
+sticky read/write/resize failures. Full-process tests include a 64 KiB allowance plus the existing
+crash, flush, disk-full, candidate-read and idempotent-resume checks.
+
+The standalone extraction default remains 512 MiB; full mode selects the bounded allowance above.
+Explicit smaller budgets still refuse without an item plan. Diagnostics retain used/limit/requested
+bytes. The limit does not guarantee every possible item fits. No partial extraction is retried and
+content checks are not relaxed.
 `writer_item_plan_test` generates nested messages with 3,000 recipients and 16 fixed-value columns,
 and 300 recipients with 16 heap-backed 2 KiB columns. Both reproduce the old limit, succeed under
 the new default, and stage the same content digest as unspooled reference extraction. Existing
@@ -276,8 +323,10 @@ Aggregate budgets target 100 GiB-class inputs: 100 GiB of full 8176-byte payload
 13.2 million external blocks, with additional capacity for partial blocks, heaps, tables and generated
 trees. File size alone cannot guarantee that block/node/metadata budgets fit. The ceilings do not
 preallocate memory; large stores may require several GiB of RAM. Writer block descriptors are at most
-40 bytes each and staged references use 24 bytes on x64, held in fixed 4096-entry chunks to avoid
-whole-index reallocation. Only generated internal blocks own byte vectors. Payloads remain streamed.
+40 bytes each and staged references use 24 bytes on x64. Full mode pages these descriptors; the
+writer also uses one fixed 4096-record working window. Its optional returned block-layout vector is
+omitted in full mode, and BBT leaf keys are supplied on demand. Legacy adapters retain their layout
+metadata for diagnostics/tests. Only generated internal blocks own byte vectors. Payloads remain streamed.
 This capacity model is not real-mailbox or Outlook acceptance at 100 GiB.
 
 Assembly shares raw external blocks using CRC32 followed by exact bytes; CRC alone is insufficient.

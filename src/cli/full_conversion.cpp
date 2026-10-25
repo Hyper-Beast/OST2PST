@@ -188,6 +188,7 @@ class Progress {
 };
 
 struct FolderState {
+    std::shared_ptr<util::MemoryReservation> reservation;
     writer::FolderSummary summary;
     std::vector<writer::ContentProperty> properties;
     std::vector<size_t> normal, associated;
@@ -196,12 +197,24 @@ Result<std::map<uint32_t, FolderState>> folders(const ltp::LtpReadReport& census
                                                 ltp::BlockSource& blocks,
                                                 const msg::MailboxManifest& manifest,
                                                 const msg::OutcomeLedger& ledger,
-                                                const std::wstring& scratch_directory) {
+                                                std::shared_ptr<util::Workspace> resources) {
     std::map<uint32_t, FolderState> result;
-    util::ByteBudget retained(64 * 1024 * 1024);
-    util::ValueSpool spool(scratch_directory);
+    auto retained = std::make_shared<util::MemoryReservation>(resources->memory);
+    util::ValueSpool spool(resources);
+    const auto reserve = [&](uint64_t bytes, const char* field, uint64_t = 0) -> Status {
+        auto result = retained->reserve(bytes, field);
+        if (!result.ok()) {
+            auto spilled = spool.spill_shared_cache();
+            if (!spilled.ok())
+                return spilled;
+            result = retained->reserve(bytes, field);
+        }
+        return result;
+    };
     msg::SubsetOptions options;
     options.spool = &spool;
+    options.workspace = resources;
+    options.workspace_budget = std::max<uint64_t>(512ull << 20, resources->memory->limit());
     for (const auto& folder : manifest.folders) {
         auto extracted = msg::extract_folder(census, blocks, folder.source_nid, options);
         if (!extracted.ok())
@@ -222,19 +235,20 @@ Result<std::map<uint32_t, FolderState>> folders(const ltp::LtpReadReport& census
         if (value.report.values_dropped != 0 || value.report.named_unresolved != 0)
             return invalid("full.folder_emission", folder.source_nid, "folder properties lost")
                 .error();
-        auto reserved = retained.reserve(
-            2 * sizeof(FolderState) + 128 + 4 * value.folder.name.capacity() +
-                2 * value.folder.properties.capacity() * sizeof(writer::ContentProperty),
-            "full.folder_workspace", folder.source_nid);
+        auto reserved =
+            reserve(2 * sizeof(FolderState) + 128 + 4 * value.folder.name.capacity() +
+                        2 * value.folder.properties.capacity() * sizeof(writer::ContentProperty),
+                    "full.folder_workspace", folder.source_nid);
         if (!reserved.ok())
             return reserved.error();
         for (const auto& property : value.folder.properties) {
-            reserved = retained.reserve(2 * property.value.capacity() + 128,
-                                        "full.folder_workspace", folder.source_nid);
+            reserved = reserve(2 * property.value.capacity() + 128, "full.folder_workspace",
+                               folder.source_nid);
             if (!reserved.ok())
                 return reserved.error();
         }
         FolderState state;
+        state.reservation = retained;
         state.summary.nid = folder.output_nid;
         state.summary.parent_nid = folder.output_parent;
         state.summary.name =
@@ -254,7 +268,7 @@ Result<std::map<uint32_t, FolderState>> folders(const ltp::LtpReadReport& census
             continue;
         auto& state = result.at(committed.outcome.item.output_parent);
         auto& rows = committed.outcome.item.associated ? state.associated : state.normal;
-        auto reserved = retained.reserve(4 * sizeof(size_t), "full.folder_workspace");
+        auto reserved = reserve(4 * sizeof(size_t), "full.folder_workspace");
         if (!reserved.ok())
             return reserved.error();
         rows.push_back(committed.record);
@@ -276,12 +290,13 @@ Result<std::map<uint32_t, FolderState>> folders(const ltp::LtpReadReport& census
 }
 
 Status replay(const writer::StagingJournal& journal, const msg::MailboxManifest& manifest,
-              msg::OutcomeLedger& ledger, std::set<uint32_t>& committed_folders, bool& scaffold) {
+              msg::OutcomeLedger& ledger, std::set<uint32_t>& committed_folders, bool& scaffold,
+              std::shared_ptr<util::Workspace> resources) {
     std::map<uint32_t, msg::MailboxFolder> expected;
     for (const auto& folder : manifest.folders)
         expected.emplace(folder.source_nid, folder);
     for (size_t record = 0; record < journal.records().size(); ++record) {
-        auto loaded = writer::read_staged_plan(journal, record);
+        auto loaded = writer::read_staged_plan(journal, record, resources);
         if (!loaded.ok())
             return loaded.error();
         const auto& plan = loaded.value();
@@ -341,7 +356,8 @@ Status replay(const writer::StagingJournal& journal, const msg::MailboxManifest&
 }
 
 Status verify_candidate(const std::wstring& path, uint64_t size,
-                        const msg::MailboxManifest& manifest, const msg::OutcomeLedger& ledger) {
+                        const msg::MailboxManifest& manifest, const msg::OutcomeLedger& ledger,
+                        std::shared_ptr<util::Workspace> resources) {
     auto opened = util::FileReader::open(path);
     if (!opened.ok())
         return opened.error();
@@ -400,9 +416,11 @@ Status verify_candidate(const std::wstring& path, uint64_t size,
         }
         if (!node.ok() || node.value().nid_parent != outcome.item.output_parent)
             return invalid("full.verify_item", outcome.item.output_nid, "committed item is absent");
-        util::ValueSpool spool(std::filesystem::path(path).parent_path().wstring());
+        util::ValueSpool spool(resources);
         msg::SubsetOptions extraction;
         extraction.spool = &spool;
+        extraction.workspace = resources;
+        extraction.workspace_budget = std::max<uint64_t>(512ull << 20, resources->memory->limit());
         auto extracted = msg::extract_item(census, blocks, outcome.item.output_nid, extraction);
         if (!extracted.ok())
             return extracted.error();
@@ -443,14 +461,14 @@ Status reports(writer::Publication& publication, const writer::StagingWorkspace&
                const writer::StagingJournal& journal, const msg::MailboxManifest& manifest,
                const msg::OutcomeLedger& ledger, const msg::InvocationAttempts& attempts,
                uint64_t recovered, bool complete, const writer::StagedAssemblyStats& assembly,
-               Clock::time_point start, bool resumed) {
+               Clock::time_point start, bool resumed, std::shared_ptr<util::Workspace> resources) {
     auto& items = publication.file(writer::PublicationArtifact::kItems);
     auto reset = items.resize(0);
     if (!reset.ok())
         return reset;
     for (const auto& [source, committed] : ledger.items()) {
         (void)source;
-        auto loaded = writer::read_staged_plan(journal, committed.record);
+        auto loaded = writer::read_staged_plan(journal, committed.record, resources);
         if (!loaded.ok())
             return loaded.error();
         auto written = append_text(items, loaded.value().details.json + '\n');
@@ -536,7 +554,10 @@ Status reports(writer::Publication& publication, const writer::StagingWorkspace&
         out << static_cast<double>(workspace.manifest().conversion.source_size) / seconds;
     else
         out << "null";
-    out << "}}\n";
+    out << "},\"resources\":{\"memory_limit_bytes\":" << resources->memory->limit()
+        << ",\"peak_managed_bytes\":" << resources->memory->peak()
+        << ",\"scratch_spilled_bytes\":" << resources->spilled_bytes
+        << ",\"scope\":\"managed_workspace\"}}\n";
     auto& summary = publication.file(writer::PublicationArtifact::kSummary);
     reset = summary.resize(0);
     if (!reset.ok())
@@ -602,6 +623,10 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
     identity.source_sha256 = digest.value();
     identity.source_size = file.size();
     identity.source_profile = writer::staging_profile_tag(census.profile);
+    const uint64_t required_records = manifest.items.size() + manifest.folders.size() + 1;
+    if (required_records > 1000000)
+        return util::make_error(ErrorKind::kUnsupported, "full.record_budget", 0, required_records);
+    identity.record_budget = static_cast<uint32_t>(std::max<uint64_t>(100000, required_records));
     identity.converter_sha256 = binary_digest.value();
     identity.options = {{"mode", "full-v1"}, {"hierarchy", "imported-ost"}, {"search", "excluded"}};
     writer::RunId id{};
@@ -632,10 +657,19 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
         return static_cast<int>(completed.exit_code);
     }
     auto& journal = workspace.journal();
+    auto resources = std::make_shared<util::Workspace>(
+        workspace.directory(), hooks.cache_limit_bytes.value_or(util::automatic_memory_limit(
+                                   util::available_physical_memory())));
+    resources->monitor_pressure = !hooks.cache_limit_bytes.has_value();
+    std::fprintf(stderr,
+                 "conversion resources cache_limit_bytes=%llu extraction_accounting_bytes=%llu\n",
+                 static_cast<unsigned long long>(resources->memory->limit()),
+                 static_cast<unsigned long long>(
+                     std::max<uint64_t>(512ull << 20, resources->memory->limit())));
     msg::OutcomeLedger ledger(manifest);
     std::set<uint32_t> committed_folders;
     bool scaffold = false;
-    auto replayed = replay(journal, manifest, ledger, committed_folders, scaffold);
+    auto replayed = replay(journal, manifest, ledger, committed_folders, scaffold, resources);
     if (!replayed.ok())
         return replayed.error();
     const uint64_t recovered = ledger.totals().terminal;
@@ -651,9 +685,11 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
             return invalid("full.ready_ledger", item.source_nid, "sealed publication is incomplete")
                 .error();
         ++(item.associated ? attempts.associated : attempts.normal);
-        util::ValueSpool spool(workspace.directory());
+        util::ValueSpool spool(resources);
         msg::SubsetOptions extraction;
         extraction.spool = &spool;
+        extraction.workspace = resources;
+        extraction.workspace_budget = std::max<uint64_t>(512ull << 20, resources->memory->limit());
         auto prepared = msg::prepare_item(census, blocks, item, manifest.registry, extraction);
         if (!prepared.ok())
             return prepared.error();
@@ -670,7 +706,7 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
                                          value.outcome.status == msg::ItemStatus::kConverted
                                              ? writer::StagedOutcome::kConverted
                                              : writer::StagedOutcome::kFailed,
-                                         value.content.plan, metadata, hooks.commit);
+                                         value.content.plan, metadata, hooks.commit, resources);
         if (!staged.ok())
             return staged.error();
         auto accepted = ledger.accept(record, key, value.outcome);
@@ -688,7 +724,7 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
                           !unsupported_coverage;
     if (publication.phase() == writer::PublicationPhase::kBuilding) {
         progress.show("folders", &ledger, manifest.items.size(), 0, true);
-        auto states_result = folders(census, blocks, manifest, ledger, workspace.directory());
+        auto states_result = folders(census, blocks, manifest, ledger, resources);
         if (!states_result.ok())
             return states_result.error();
         auto states = states_result.take();
@@ -696,8 +732,10 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
             if (committed_folders.contains(folder.source_nid))
                 continue;
             auto& state = states.at(folder.output_nid);
-            writer::StagedRows normal(journal, state.normal), associated(journal, state.associated);
+            writer::StagedRows normal(journal, std::move(state.normal), resources),
+                associated(journal, std::move(state.associated), resources);
             writer::FolderPlanRequest request;
+            request.workspace = resources;
             request.folder = state.summary;
             request.properties = std::move(state.properties);
             request.normal_rows = &normal;
@@ -710,10 +748,10 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
             auto plan = writer::build_folder_plan(request, manifest.registry.entries().size());
             if (!plan.ok())
                 return plan.error();
-            auto staged =
-                writer::stage_plan(journal, auxiliary_key(2, folder.source_nid, folder.output_nid),
-                                   writer::StagedOutcome::kConverted, plan.value().plan,
-                                   auxiliary_details(2, folder.source_nid, folder.output_nid));
+            auto staged = writer::stage_plan(
+                journal, auxiliary_key(2, folder.source_nid, folder.output_nid),
+                writer::StagedOutcome::kConverted, plan.value().plan,
+                auxiliary_details(2, folder.source_nid, folder.output_nid), {}, resources);
             if (!staged.ok())
                 return staged.error();
             observe(FullPoint::kFolderCommitted);
@@ -727,12 +765,12 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
             }
             auto plan = writer::build_scaffold_plan(
                 manifest.registry.entries(), children, manifest.last_folder_index,
-                manifest.last_normal_index, manifest.last_associated_index);
+                manifest.last_normal_index, manifest.last_associated_index, resources);
             if (!plan.ok())
                 return plan.error();
             auto staged = writer::stage_plan(journal, auxiliary_key(3, 0, 0),
                                              writer::StagedOutcome::kConverted, plan.value().plan,
-                                             auxiliary_details(3, 0, 0));
+                                             auxiliary_details(3, 0, 0), {}, resources);
             if (!staged.ok())
                 return staged.error();
             observe(FullPoint::kScaffoldCommitted);
@@ -751,7 +789,10 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
         writer::StagedAssemblyStats assembly;
         observe(FullPoint::kAssemblyBegin);
         ObservedCandidate observed_candidate(candidate, hooks);
-        auto assembled = writer::assemble_staged(journal, observed_candidate, {}, &assembly);
+        writer::StagedAssemblyOptions assembly_options;
+        assembly_options.workspace = resources;
+        auto assembled =
+            writer::assemble_staged(journal, observed_candidate, assembly_options, &assembly);
         if (!assembled.ok())
             return assembled.error();
         observe(FullPoint::kAssembled);
@@ -762,7 +803,7 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
             return closed.error();
         observe(FullPoint::kVerificationOpen);
         auto verified = verify_candidate(publication.path(writer::PublicationArtifact::kPst),
-                                         candidate_size, manifest, ledger);
+                                         candidate_size, manifest, ledger, resources);
         if (!verified.ok())
             return verified.error();
         observe(FullPoint::kVerified);
@@ -778,7 +819,7 @@ Result<int> convert(const std::wstring& input, const std::wstring& output, bool 
             return invalid("full.source_changed", 0, "stable source changed before publication")
                 .error();
         auto reported = reports(publication, workspace, journal, manifest, ledger, attempts,
-                                recovered, complete, assembly, start, resume);
+                                recovered, complete, assembly, start, resume, resources);
         if (!reported.ok())
             return reported.error();
         observe(FullPoint::kReportsWritten);

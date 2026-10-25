@@ -82,6 +82,8 @@ bool source_fixture(const std::filesystem::path& path) {
 int child(const std::filesystem::path& source, const std::filesystem::path& output, int point,
           bool resume) {
     cli::FullConversionHooks hooks;
+    if (point == 93)
+        hooks.cache_limit_bytes = 64 * 1024;
     if (point == 92)
         hooks.index_workspace_budget = 1;
     hooks.initialization = [&](writer::InitializationPoint value) {
@@ -151,6 +153,14 @@ void check_full_process_recovery() {
     TEST_EQ(run(baseline, -1, false), 0u, "uninterrupted full conversion baseline");
     const auto expected = read_bytes(baseline);
     const auto expected_items = read_bytes(baseline.wstring() + L".items.jsonl");
+    const auto constrained = root / L"constrained.pst";
+    TEST_EQ(run(constrained, 93, false), 0u, "full pipeline with a 64 KiB shared cache");
+    TEST_CHECK(read_bytes(constrained) == expected);
+    TEST_CHECK(read_bytes(constrained.wstring() + L".items.jsonl") == expected_items);
+    const auto constrained_report = read_bytes(constrained.wstring() + L".report.json");
+    const std::string constrained_text(constrained_report.begin(), constrained_report.end());
+    TEST_CHECK(constrained_text.find("\"memory_limit_bytes\":65536") != std::string::npos);
+    remove_fixture_output(constrained);
     const std::vector<int> points{0,  1,  2,  3,  4,  5,  10, 11, 12, 13, 20,
                                   21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
                                   32, 33, 40, 41, 50, 51, 52, 53, 90, 91, 92};

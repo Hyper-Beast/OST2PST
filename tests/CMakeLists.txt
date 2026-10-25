@@ -32,6 +32,7 @@ ost2pst_add_unit_test(file_reader_test)
 ost2pst_add_unit_test(file_identity_test)
 ost2pst_add_unit_test(file_writer_test)
 ost2pst_add_unit_test(value_spool_test)
+ost2pst_add_unit_test(workspace_test)
 
 # M1: the NDB reader and the index every later layer resolves BIDs through.
 ost2pst_add_unit_test(bbt_index_test)

@@ -31,6 +31,8 @@ Close Outlook before copying the OST, or use an immutable copy.
 - Streams large values through bounded storage; shares identical output blocks only after
   exact byte comparison; reports phase and item progress.
 - Supports interrupted-run recovery with `--resume`, per-item outcomes and aggregate reports.
+- Automatically budgets workspace from available RAM and spills large tables/metadata to temporary
+  disk storage. Temporary disk use can grow; the workspace allowance is not a total process-memory cap.
 - Provides `--dry-run`, `--verify`, empty-store generation and folder-subset conversion.
 - Supports unencoded Unicode 4 KiB-page input and 512-byte-page PST structures; writes a
   512-byte-page Unicode PST. ANSI, WIP version 37 and nonzero `bCryptMethod` are refused.
@@ -112,6 +114,11 @@ flush, publication and cleanup are excluded. Resume records only the invocation 
 so throughput is `null` for resumed runs. A previously sealed/published report retains its original
 measurements on resume. GUI and CLI use the same report; closing the GUI does not remove these fields.
 
+The report's `resources` object records `memory_limit_bytes`, `peak_managed_bytes` and
+`scratch_spilled_bytes` for this invocation. These describe the managed workspace; use
+`performance.peak_working_set_bytes` for measured process memory. Spilled bytes are cumulative scratch
+growth, not peak disk usage, and may include multiple processing passes.
+
 Check the exit code and report: a partial output may exist even when the run is incomplete. An interrupted
 run keeps `<output>.work`; resume with the same source, binary, paths and options. A changed
 source/binary is refused. Full conversion does not accept `--force`; choose a fresh destination.
@@ -169,6 +176,27 @@ The timing includes identity hashing, indexing, conversion, assembly, internal v
 report publication and cleanup. Available content matched in complete mapped comparisons and
 independent libpff API/export checks: 70,284 exported files, 2,639,753,214 compared bytes,
 zero byte differences. Private inputs, exports and raw logs are excluded from this repository.
+
+A retest of the same immutable input with the adaptive-workspace build completed all 11,404
+items with no skips or failures. Source, committed and internally reread output counts agree for
+18,946 attachments, 150 embedded messages and 54,904 recipients; the PST size is unchanged.
+The retest report does not record hardware configuration, so these results are not a controlled
+performance comparison with the earlier build.
+
+| Measurement | Adaptive-workspace retest |
+| --- | ---: |
+| Report time, before publication | 131.061 s |
+| Report throughput | 20.108 MB/s |
+| Whole invocation time | 158.614 s (2 min 38.614 s) |
+| Whole invocation throughput | 16.615 MB/s |
+| Peak process working set | 70,205,440 bytes (66.95 MiB) |
+| Peak managed workspace | 45,877,776 bytes (43.75 MiB) |
+| Scratch spilled bytes | 0 |
+
+This retest passed internal verification but did not repeat the historical external content or
+Outlook checks. It did not need disk spill; it does not establish performance for larger tables
+that require spill. Report timing excludes final publication/cleanup, while invocation timing
+includes those stages.
 
 A later real-mailbox run on an Intel Core Ultra 5 235U / 16 GB RAM / SSD machine completed
 without errors. Its source snapshot differs from an earlier run on this machine. The aggregate
@@ -252,6 +280,8 @@ M1–M7 转换器里程碑已完成；本版本包含 CLI 和原生 Windows 四�
 - 转换实际文件夹、普通邮件、FAI 关联项、收件人、附件和嵌入邮件，保留源文件中可读取的属性及内容。
 - 提供阶段与条目进度、断点恢复、逐项结果、汇总报告、只读预检和结构验证。
 - 使用有界内存及磁盘暂存，逐项提交；相同输出块须经逐字节比较后才共享。
+- 根据可用内存自动分配工作区，大型表和元数据超出额度后转存临时文件。临时磁盘占用可能增加；
+  工作区额度并不等于整个进程的内存上限。
 - 支持未编码 Unicode 4 KiB 页面输入及 512 字节页面 PST 结构；输出 Unicode 512 字节页面 PST。
   ANSI、WIP 版本 37 和非零 `bCryptMethod` 会明确拒绝。
 
@@ -301,6 +331,10 @@ libpff；默认 MSVC 构建使用微软 C++ 运行库，缺少时安装 x64 Visu
 断点恢复只记录生成报告的那次启动，吞吐量为 `null`；若报告此前已封存或发布，则保留原统计。
 GUI 与 CLI 使用同一份报告。
 
+`resources` 对象记录本次启动的 `memory_limit_bytes`（工作区额度）、`peak_managed_bytes`
+（受管理内存的核算峰值）及 `scratch_spilled_bytes`（累计转存字节数）。进程实际峰值仍看
+`performance.peak_working_set_bytes`。累计转存量可能包含多遍处理，不代表磁盘占用峰值。
+
 `--dry-run <input> [output]` 只做结构与邮箱清单预检，不写文件，也不检查所有内容或输出可写性。
 `--verify <file>` 只验证支持的结构，不证明源内容完全一致或 Outlook 一定兼容。
 其他选项见 `--help`。
@@ -345,6 +379,23 @@ NDB 解析页面、块和 B 树；LTP 解析堆、属性上下文、表上下文
 完整用时包含身份哈希、索引、转换、组装、内部验证、报告发布和清理。完整映射比较及独立
 libpff API/导出比较通过：70,284 个导出文件、2,639,753,214 字节，逐字节差异为零。
 原始邮箱、导出内容和详细日志均未放入本项目。
+
+同一份固定输入在采用自适应工作区的版本中重测，11,404 项全部转换，跳过和失败均为零。
+18,946 个附件、150 封嵌入邮件和 54,904 个收件人的源端、已提交及内部回读计数一致，PST 大小不变。
+这次报告没有记录硬件配置，因此这些数据不作为与早期版本的受控性能比较。
+
+| 指标 | 自适应工作区版本重测 |
+| --- | ---: |
+| 报告耗时，发布前截止 | 131.061 秒 |
+| 报告吞吐量 | 20.108 MB/s |
+| 整次进程耗时 | 158.614 秒（2 分 38.614 秒） |
+| 整次进程吞吐量 | 16.615 MB/s |
+| 进程峰值工作集 | 70,205,440 字节（66.95 MiB） |
+| 受管工作区核算峰值 | 45,877,776 字节（43.75 MiB） |
+| 累计磁盘转存量 | 0 |
+
+本次内部校验通过，未重复此前的外部内容对照及 Outlook 检查。该样本不需要磁盘转存，
+不能据此推断需要转存的大型表的性能。报告耗时不含最终发布和清理，整次进程耗时包含这些阶段。
 
 Intel Core Ultra 5 235U、16 GB RAM、SSD 机器上的一次较新真实邮箱转换没有报错。
 这次使用的 OST 快照与该机器先前的样本不同；汇总报告记录状态为 `complete`、

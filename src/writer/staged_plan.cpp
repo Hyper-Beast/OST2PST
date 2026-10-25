@@ -33,13 +33,29 @@ Status invalid(const char* field, uint64_t value, const char* detail) {
 
 class Encoder {
   public:
+    explicit Encoder(std::shared_ptr<util::Workspace> workspace = {}) {
+        if (workspace)
+            spool = std::make_shared<util::SpillBuffer>(workspace);
+    }
     std::vector<uint8_t> bytes;
+    std::shared_ptr<util::SpillBuffer> spool;
     Status status;
+    uint64_t size() const { return spool ? spool->size() : bytes.size(); }
+    void raw(const uint8_t* data, size_t count) {
+        if (!status.ok())
+            return;
+        if (spool)
+            status = spool->append(ByteView(data, count));
+        else if (count)
+            bytes.insert(bytes.end(), data, data + count);
+    }
     void number(uint64_t value, size_t width) {
         if (!space(width))
             return;
+        std::array<uint8_t, 8> encoded{};
         for (size_t byte = 0; byte < width; ++byte)
-            bytes.push_back(static_cast<uint8_t>(value >> (byte * 8)));
+            encoded[byte] = static_cast<uint8_t>(value >> (byte * 8));
+        raw(encoded.data(), width);
     }
     void blob(const uint8_t* data, size_t size) {
         if (size > std::numeric_limits<uint32_t>::max()) {
@@ -50,15 +66,14 @@ class Encoder {
         if (!space(size + 4))
             return;
         number(size, 4);
-        if (size != 0)
-            bytes.insert(bytes.end(), data, data + size);
+        raw(data, size);
     }
     void string(const std::string& text) {
         blob(reinterpret_cast<const uint8_t*>(text.data()), text.size());
     }
     void blob(const util::ByteSource& source) {
         const auto size = source.size();
-        if (size > kMetadataBytes) {
+        if (size > (spool ? UINT32_MAX : kMetadataBytes)) {
             status = invalid("staged_plan.metadata_budget", size,
                              "streamed row exceeds the metadata budget");
             return;
@@ -66,18 +81,17 @@ class Encoder {
         if (!space(static_cast<size_t>(size) + 4))
             return;
         number(size, 4);
-        const auto start = bytes.size();
-        bytes.resize(start + static_cast<size_t>(size));
+        std::array<uint8_t, 8192> buffer{};
         // The metadata itself has a fixed engineering bound; the backing read still
         // uses bounded windows and never collects a second value-sized vector.
         for (uint64_t offset = 0; offset < size; offset += 8192) {
             const auto chunk = static_cast<size_t>(std::min<uint64_t>(8192, size - offset));
-            auto read =
-                source.read_at(offset, bytes.data() + start + static_cast<size_t>(offset), chunk);
+            auto read = source.read_at(offset, buffer.data(), chunk);
             if (!read.ok()) {
                 status = read;
                 return;
             }
+            raw(buffer.data(), chunk);
         }
     }
 
@@ -85,7 +99,8 @@ class Encoder {
     bool space(size_t count) {
         if (!status.ok())
             return false;
-        if (count > kMetadataBytes - bytes.size()) {
+        const uint64_t limit = spool ? UINT32_MAX : kMetadataBytes;
+        if (count > limit - size()) {
             status = invalid("staged_plan.metadata_budget", count,
                              "metadata exceeds its bounded record budget");
             return false;
@@ -97,17 +112,38 @@ class Encoder {
 class Decoder {
   public:
     explicit Decoder(ByteView bytes) : bytes_(bytes) {}
+    explicit Decoder(util::SharedBytes source) : source_(std::move(source)) {}
     Status status;
+    uint64_t size() const { return source_ ? source_->size() : bytes_.size(); }
+    bool in_range(uint64_t offset, uint64_t count) const {
+        return offset <= size() && count <= size() - offset;
+    }
+    void read(uint64_t offset, uint8_t* target, size_t count) {
+        if (!status.ok())
+            return;
+        if (source_)
+            status = source_->read_at(offset, target, count);
+        else
+            std::copy_n(bytes_.data() + offset, count, target);
+    }
     uint64_t number(size_t width) {
         if (!status.ok())
             return 0;
-        if (!bytes_.in_range(at_, width)) {
+        if (!in_range(at_, width)) {
             status = invalid("staged_plan.truncated", at_, "metadata field is truncated");
             return 0;
         }
         uint64_t result = 0;
-        for (size_t byte = 0; byte < width; ++byte)
-            result |= uint64_t{bytes_.data()[at_++]} << (byte * 8);
+        for (size_t byte = 0; byte < width; ++byte) {
+            if (at_ < cache_start_ || at_ >= cache_start_ + cache_size_) {
+                cache_start_ = at_;
+                cache_size_ = static_cast<size_t>(std::min<uint64_t>(cache_.size(), size() - at_));
+                read(at_, cache_.data(), cache_size_);
+                if (!status.ok())
+                    return 0;
+            }
+            result |= uint64_t{cache_[static_cast<size_t>(at_++ - cache_start_)]} << (byte * 8);
+        }
         return result;
     }
     uint32_t count(uint32_t limit = kObjects) {
@@ -118,17 +154,18 @@ class Decoder {
         }
         return result;
     }
-    std::vector<uint8_t> blob() {
-        const uint32_t size = count(static_cast<uint32_t>(kMetadataBytes));
+    std::vector<uint8_t> blob(uint32_t limit = static_cast<uint32_t>(kMetadataBytes)) {
+        const uint32_t size = count(limit);
         if (!status.ok())
             return {};
         if (size == 0)
             return {};
-        if (!bytes_.in_range(at_, size)) {
+        if (!in_range(at_, size)) {
             status = invalid("staged_plan.blob", size, "metadata byte string is truncated");
             return {};
         }
-        std::vector<uint8_t> result(bytes_.data() + at_, bytes_.data() + at_ + size);
+        std::vector<uint8_t> result(size);
+        read(at_, result.data(), result.size());
         at_ += size;
         return result;
     }
@@ -136,11 +173,46 @@ class Decoder {
         auto bytes = blob();
         return std::string(bytes.begin(), bytes.end());
     }
-    bool finished() const { return status.ok() && at_ == bytes_.size(); }
+    util::SharedBytes source_blob() {
+        const auto count = number(4);
+        if (!status.ok())
+            return {};
+        if (!in_range(at_, count)) {
+            status = invalid("staged_plan.blob", count, "metadata byte string is truncated");
+            return {};
+        }
+        util::SharedBytes result;
+        if (count)
+            result = std::make_shared<util::SourceRange>(source_, at_, count);
+        at_ += static_cast<size_t>(count);
+        return result;
+    }
+    bool finished() const { return status.ok() && at_ == size(); }
 
   private:
     ByteView bytes_;
+    util::SharedBytes source_;
+    std::array<uint8_t, 8192> cache_{};
+    uint64_t cache_start_ = UINT64_MAX;
+    size_t cache_size_ = 0;
     size_t at_ = 0;
+};
+
+class JournalRange final : public util::ByteSource {
+  public:
+    JournalRange(const StagingJournal& journal, size_t record, uint64_t offset, uint64_t size)
+        : journal_(journal), record_(record), offset_(offset), size_(size) {}
+    uint64_t size() const override { return size_; }
+    Status read_at(uint64_t offset, uint8_t* target, size_t count) const override {
+        if (offset > size_ || count > size_ - offset)
+            return invalid("staged_plan.range", offset, "read exceeds committed metadata");
+        return journal_.read_committed(record_, offset_ + offset, target, count);
+    }
+
+  private:
+    const StagingJournal& journal_;
+    size_t record_;
+    uint64_t offset_, size_;
 };
 
 template <class Node>
@@ -212,26 +284,48 @@ template <class Node> void relocate(Node& node, uint64_t base) {
 
 class JournalBlocks final : public StoreBlockSource {
   public:
-    explicit JournalBlocks(const StagingJournal& journal) : journal_(journal) {}
+    explicit JournalBlocks(const StagingJournal& journal,
+                           std::shared_ptr<util::Workspace> workspace = {})
+        : journal_(journal) {
+        if (workspace)
+            paged_ = std::make_unique<util::SpillArray<StagedBlockRef>>(workspace);
+    }
     BlockIndex<StagedBlockRef> refs;
-    uint64_t count() const override { return refs.size(); }
+    uint64_t count() const override { return paged_ ? paged_->size() : refs.size(); }
+    StagedBlockRef ref(uint64_t index) const {
+        return paged_ ? paged_->get(index) : refs[static_cast<size_t>(index)];
+    }
+    Status status() const { return paged_ ? paged_->status() : Status{}; }
+    Status spill() { return paged_ ? paged_->bytes()->spill_to_disk() : Status{}; }
+    Status append(const StagedBlockRef& value) {
+        if (paged_)
+            return paged_->push_back(value);
+        refs.push_back(value);
+        return {};
+    }
     Result<uint16_t> block_size(uint64_t index) const override {
-        if (index >= refs.size())
+        if (index >= count())
             return invalid("staged_plan.block", index, "block index is out of range").error();
-        return refs[static_cast<size_t>(index)].size;
+        const auto value = ref(index);
+        if (!status().ok())
+            return status().error();
+        return value.size;
     }
     Status read_block(uint64_t index, uint8_t* data, size_t size) const override {
-        if (index >= refs.size())
+        if (index >= count())
             return invalid("staged_plan.block", index, "block index is out of range");
-        const auto& ref = refs[static_cast<size_t>(index)];
-        if (size != ref.size)
+        const auto value = ref(index);
+        if (!status().ok())
+            return status();
+        if (size != value.size)
             return invalid("staged_plan.block_size", size,
                            "read must match the external block size");
-        return journal_.read_committed(ref.record, ref.offset, data, size);
+        return journal_.read_committed(value.record, value.offset, data, size);
     }
 
   private:
     const StagingJournal& journal_;
+    std::unique_ptr<util::SpillArray<StagedBlockRef>> paged_;
 };
 
 // A bounded fingerprint index over staged bytes. CRC only selects candidates; byte equality
@@ -264,6 +358,15 @@ class SharingIndex {
     }
 
     StagedAssemblyStats stats;
+    void release_cache() {
+        heads_.clear();
+        heads_.shrink_to_fit();
+        entries_.clear();
+        entries_.shrink_to_fit();
+        capacity_ = 0;
+        stats.index_entries = 0;
+        stats.index_saturated = true;
+    }
 
   private:
     static constexpr uint32_t kEnd = UINT32_MAX;
@@ -277,18 +380,22 @@ class SharingIndex {
     static_assert(sizeof(Entry) <= 32);
 
     Result<uint64_t> append(const StagedBlockRef& ref) {
-        if (blocks_.refs.size() >= kStoreMaxBlocks)
+        if (blocks_.count() >= kStoreMaxBlocks)
             return make_error(ErrorKind::kUnsupported, "staged_plan.assembly_count", 0,
-                              blocks_.refs.size(),
+                              blocks_.count(),
                               "physical block descriptors exceed the assembly capacity");
-        const auto slot = blocks_.refs.size();
-        blocks_.refs.push_back(ref);
+        const auto slot = blocks_.count();
+        auto appended = blocks_.append(ref);
+        if (!appended.ok())
+            return appended.error();
         ++stats.stored_blocks;
         return slot;
     }
 
     Result<uint64_t> select(const StagedBlockRef& ref) {
         ++stats.block_references;
+        if (heads_.empty())
+            return append(ref);
         auto read = journal_.read_committed(ref.record, ref.offset, bytes_.data(), ref.size);
         if (!read.ok())
             return read.error();
@@ -343,7 +450,7 @@ class SharingIndex {
 
 Status stage_plan(StagingJournal& journal, const util::Sha256Digest& key, StagedOutcome outcome,
                   const StorePlan& plan, const StagedDetails& details,
-                  const CommitObserver& observer) {
+                  const CommitObserver& observer, std::shared_ptr<util::Workspace> workspace) {
     if (plan.blocks.size() > kObjects || plan.nodes.size() > kObjects ||
         (!plan.rgnid.empty() && plan.rgnid.size() != ndb::kRgnidCount) ||
         details.counters.size() > 1024) {
@@ -355,7 +462,7 @@ Status stage_plan(StagingJournal& journal, const util::Sha256Digest& key, Staged
         return invalid("staged_plan.outcome", static_cast<uint32_t>(outcome),
                        "failed/excluded outcome cannot carry content");
     }
-    Encoder encoded;
+    Encoder encoded(workspace);
     encoded.number(plan.blocks.size(), 4);
     uint64_t payload = 0;
     for (const auto& block : plan.blocks) {
@@ -418,7 +525,7 @@ Status stage_plan(StagingJournal& journal, const util::Sha256Digest& key, Staged
     Encoder header;
     header.bytes.assign(kMagic.begin(), kMagic.end());
     header.number(1, 4);
-    header.number(encoded.bytes.size(), 4);
+    header.number(encoded.size(), 4);
     header.number(payload, 8);
     auto status = journal.begin(key, outcome);
     if (!status.ok())
@@ -426,7 +533,20 @@ Status stage_plan(StagingJournal& journal, const util::Sha256Digest& key, Staged
     status = journal.append(ByteView(header.bytes.data(), header.bytes.size(), 0));
     if (!status.ok())
         return status;
-    status = journal.append(ByteView(encoded.bytes.data(), encoded.bytes.size(), 0));
+    if (encoded.spool) {
+        std::array<uint8_t, 8192> window{};
+        for (uint64_t offset = 0; offset < encoded.size(); offset += window.size()) {
+            const auto count =
+                static_cast<size_t>(std::min<uint64_t>(window.size(), encoded.size() - offset));
+            status = encoded.spool->read_at(offset, window.data(), count);
+            if (!status.ok())
+                return status;
+            status = journal.append(ByteView(window.data(), count));
+            if (!status.ok())
+                return status;
+        }
+    } else
+        status = journal.append(ByteView(encoded.bytes.data(), encoded.bytes.size(), 0));
     if (!status.ok())
         return status;
     std::array<uint8_t, ndb::kPstBlockMaxCb> buffer{};
@@ -445,7 +565,8 @@ Status stage_plan(StagingJournal& journal, const util::Sha256Digest& key, Staged
     return journal.commit(observer);
 }
 
-Result<StagedPlan> read_staged_plan(const StagingJournal& journal, size_t record) {
+Result<StagedPlan> read_staged_plan(const StagingJournal& journal, size_t record,
+                                    std::shared_ptr<util::Workspace> workspace) {
     if (record >= journal.records().size())
         return invalid("staged_plan.record", record, "record does not exist").error();
     std::array<uint8_t, kHeaderBytes> header{};
@@ -461,16 +582,19 @@ Result<StagedPlan> read_staged_plan(const StagingJournal& journal, size_t record
     const uint64_t metadata_size = view.u32(12).value();
     const uint64_t payload = view.u64(16).value();
     const uint64_t length = journal.records()[record].length;
-    if (metadata_size > kMetadataBytes || length < kHeaderBytes + metadata_size ||
+    if ((!workspace && metadata_size > kMetadataBytes) || length < kHeaderBytes + metadata_size ||
         payload != length - kHeaderBytes - metadata_size) {
         return invalid("staged_plan.length", record, "record frame and committed length disagree")
             .error();
     }
-    std::vector<uint8_t> bytes(static_cast<size_t>(metadata_size));
+    std::vector<uint8_t> bytes(workspace ? 0 : static_cast<size_t>(metadata_size));
     status = journal.read_committed(record, kHeaderBytes, bytes.data(), bytes.size());
     if (!status.ok())
         return status.error();
-    Decoder decoded(ByteView(bytes.data(), bytes.size(), 0));
+    Decoder decoded =
+        workspace
+            ? Decoder(std::make_shared<JournalRange>(journal, record, kHeaderBytes, metadata_size))
+            : Decoder(ByteView(bytes.data(), bytes.size(), 0));
     StagedPlan result;
     const uint32_t block_count = decoded.count();
     uint64_t offset = kHeaderBytes + metadata_size;
@@ -514,7 +638,11 @@ Result<StagedPlan> read_staged_plan(const StagingJournal& journal, size_t record
         row.row_id = static_cast<uint32_t>(decoded.number(4));
         const uint32_t cells = decoded.count(255);
         for (uint32_t index = 0; index < cells && decoded.status.ok(); ++index) {
-            row.values.push_back(decoded.blob());
+            if (workspace) {
+                row.values.emplace_back();
+                row.sources.push_back(decoded.source_blob());
+            } else
+                row.values.push_back(decoded.blob());
             const auto empty = decoded.number(1);
             if (empty > 1)
                 return invalid("staged_plan.present_empty", empty, "presence flag is not boolean")
@@ -552,7 +680,7 @@ Result<TcRow> StagedRows::read(uint64_t index) const {
     if (index >= records_.size()) {
         return invalid("staged_plan.row_index", index, "no committed row at this index").error();
     }
-    auto loaded = read_staged_plan(journal_, records_[static_cast<size_t>(index)]);
+    auto loaded = read_staged_plan(journal_, records_[static_cast<size_t>(index)], workspace_);
     if (!loaded.ok())
         return loaded.error();
     StagedPlan plan = loaded.take();
@@ -575,11 +703,27 @@ Result<StoreImage> assemble_staged(const StagingJournal& journal, util::RandomAc
         return invalid("staged_plan.sharing_budget", options.sharing_entries,
                        "sharing index exceeds its fixed memory budget")
             .error();
-    JournalBlocks blocks(journal);
+    JournalBlocks blocks(journal, options.workspace);
     std::optional<SharingIndex> sharing;
-    if (options.sharing_entries)
-        sharing.emplace(journal, blocks, options.sharing_entries);
+    auto sharing_memory = options.workspace
+                              ? std::make_unique<util::MemoryReservation>(options.workspace->memory)
+                              : nullptr;
+    uint32_t sharing_entries = options.sharing_entries;
+    if (sharing_memory) {
+        // Deduplication is optional: reduce its fixed lookup cache before refusing
+        // required metadata. Saturation still emits exact, unshared content.
+        while (
+            sharing_entries &&
+            !sharing_memory->reserve(uint64_t{sharing_entries} * 36, "staged_plan.sharing_memory")
+                 .ok())
+            sharing_entries /= 2;
+    }
+    if (sharing_entries)
+        sharing.emplace(journal, blocks, sharing_entries);
     std::vector<StoreNode> nodes;
+    auto graph_memory = options.workspace
+                            ? std::make_unique<util::MemoryReservation>(options.workspace->memory)
+                            : nullptr;
     std::vector<uint32_t> rgnid;
     uint64_t metadata_total = 0;
     for (size_t index = 0; index < journal.records().size(); ++index) {
@@ -590,21 +734,49 @@ Result<StoreImage> assemble_staged(const StagingJournal& journal, util::RandomAc
         if (!read.ok())
             return read.error();
         const uint64_t size = ByteView(header.data(), header.size(), 0).u32(12).value();
-        if (size > kAssemblyMetadataBytes - metadata_total) {
+        if (!options.workspace && size > kAssemblyMetadataBytes - metadata_total) {
             return make_error(ErrorKind::kUnsupported, "staged_plan.assembly_budget", 0, size,
                               "aggregate descriptors exceed the assembly budget");
         }
         metadata_total += size;
-        auto loaded = read_staged_plan(journal, index);
+        auto loaded = read_staged_plan(journal, index, options.workspace);
         if (!loaded.ok())
             return loaded.error();
         StagedPlan plan = loaded.take();
-        if ((!sharing && blocks.refs.size() + plan.blocks.size() > kStoreMaxBlocks) ||
+        if (graph_memory) {
+            uint64_t bytes = plan.nodes.capacity() * sizeof(StoreNode);
+            const auto measure = [&](const auto& self, const auto& node) -> void {
+                bytes += node.data_blocks.capacity() * sizeof(uint64_t) +
+                         node.subnodes.capacity() * sizeof(StoreSubnode);
+                for (const auto& child : node.subnodes)
+                    self(self, child);
+            };
+            for (const auto& node : plan.nodes)
+                measure(measure, node);
+            // Include vector growth/slack while transferring retained graphs.
+            bytes *= 2;
+            auto reserved = graph_memory->reserve(bytes, "staged_plan.resident_graph");
+            if (!reserved.ok()) {
+                auto spilled = blocks.spill();
+                if (!spilled.ok())
+                    return spilled.error();
+                reserved = graph_memory->reserve(bytes, "staged_plan.resident_graph");
+            }
+            if (!reserved.ok() && sharing_memory) {
+                if (sharing)
+                    sharing->release_cache();
+                sharing_memory.reset();
+                reserved = graph_memory->reserve(bytes, "staged_plan.resident_graph");
+            }
+            if (!reserved.ok())
+                return reserved.error();
+        }
+        if ((!sharing && blocks.count() + plan.blocks.size() > kStoreMaxBlocks) ||
             nodes.size() + plan.nodes.size() > kStoreMaxNodes) {
             return make_error(ErrorKind::kUnsupported, "staged_plan.assembly_count", 0, index,
                               "aggregate plan exceeds the writer metadata capacity");
         }
-        const uint64_t base = blocks.refs.size();
+        const uint64_t base = blocks.count();
         std::vector<bool> used(sharing ? plan.blocks.size() : 0, false);
         for (auto& node : plan.nodes) {
             if (sharing) {
@@ -621,8 +793,11 @@ Result<StoreImage> assemble_staged(const StagingJournal& journal, util::RandomAc
                 return invalid("writer.store.c_ref", index, "staged block has no references")
                     .error();
         } else {
-            for (const auto& ref : plan.blocks)
-                blocks.refs.push_back(ref);
+            for (const auto& ref : plan.blocks) {
+                auto appended = blocks.append(ref);
+                if (!appended.ok())
+                    return appended.error();
+            }
         }
         if (!plan.rgnid.empty()) {
             if (!rgnid.empty())
@@ -641,7 +816,8 @@ Result<StoreImage> assemble_staged(const StagingJournal& journal, util::RandomAc
     else
         completed.stored_blocks = blocks.count();
     sharing.reset(); // Do not retain the lookup index during writer layout and publication.
-    auto result = write_store_to(blocks, nodes, rgnid, output);
+    sharing_memory.reset();
+    auto result = write_store_to(blocks, nodes, rgnid, output, options.workspace);
     if (result.ok() && stats)
         *stats = completed;
     return result;

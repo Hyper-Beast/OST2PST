@@ -18,6 +18,84 @@ using util::Result;
 using util::Status;
 
 namespace {
+template <class T> class WorkArray {
+  public:
+    explicit WorkArray(std::shared_ptr<util::Workspace> workspace, uint64_t size = 0) {
+        if (workspace) {
+            paged_ = std::make_unique<util::SpillArray<T>>(workspace);
+            status_ = paged_->resize(size);
+        } else {
+            resident_.resize(static_cast<size_t>(size));
+        }
+    }
+    uint64_t size() const { return paged_ ? paged_->size() : resident_.size(); }
+    T get(uint64_t index) const {
+        return paged_ ? paged_->get(index) : resident_[static_cast<size_t>(index)];
+    }
+    void set(uint64_t index, T value) {
+        if (!status_.ok())
+            return;
+        if (paged_)
+            status_ = paged_->set(index, value);
+        else
+            resident_[static_cast<size_t>(index)] = value;
+    }
+    void push_back(T value) {
+        if (!status_.ok())
+            return;
+        if (paged_)
+            status_ = paged_->push_back(value);
+        else
+            resident_.push_back(value);
+    }
+    Status status() const {
+        return !status_.ok() ? status_ : (paged_ ? paged_->status() : Status{});
+    }
+
+  private:
+    std::vector<T> resident_;
+    std::unique_ptr<util::SpillArray<T>> paged_;
+    Status status_;
+};
+struct RowKey {
+    uint32_t id, original;
+};
+
+// Bounded sorted runs followed by a bottom-up merge. Scratch pages, rather than
+// all row keys or cell descriptors, compete for the shared resident allowance.
+Status sort_keys(WorkArray<RowKey>& keys, std::shared_ptr<util::Workspace> workspace) {
+    constexpr uint64_t run = 4096;
+    for (uint64_t begin = 0; begin < keys.size(); begin += run) {
+        std::vector<RowKey> batch;
+        const uint64_t end = std::min(keys.size(), begin + run);
+        for (auto index = begin; index < end; ++index)
+            batch.push_back(keys.get(index));
+        if (!keys.status().ok())
+            return keys.status();
+        std::sort(batch.begin(), batch.end(), [](auto a, auto b) { return a.id < b.id; });
+        for (size_t index = 0; index < batch.size(); ++index)
+            keys.set(begin + index, batch[index]);
+    }
+    WorkArray<RowKey> other(workspace, keys.size());
+    for (uint64_t width = run; width < keys.size(); width *= 2) {
+        for (uint64_t begin = 0; begin < keys.size(); begin += width * 2) {
+            uint64_t left = begin, right = std::min(begin + width, keys.size());
+            const auto mid = right, end = std::min(begin + width * 2, keys.size());
+            for (uint64_t out = begin; out < end; ++out) {
+                if (left < mid && (right == end || keys.get(left).id <= keys.get(right).id))
+                    other.set(out, keys.get(left++));
+                else
+                    other.set(out, keys.get(right++));
+            }
+        }
+        if (!keys.status().ok())
+            return keys.status();
+        if (!other.status().ok())
+            return other.status();
+        std::swap(keys, other);
+    }
+    return keys.status();
+}
 util::SharedBytes cell_source(const TcRow& row, size_t column) {
     return row.sources.empty() ? util::SharedBytes{} : row.sources[column];
 }
@@ -66,11 +144,15 @@ uint64_t column_width(uint32_t tag) {
 } // namespace
 
 Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
-                                const TcRowSource& rows, LocalNids& local_nids) {
+                                const TcRowSource& rows, LocalNids& local_nids,
+                                std::shared_ptr<util::Workspace> scratch) {
     const uint64_t row_count = rows.count();
     // Engineering workspace limits, not PST format limits. Includes the output heap/matrix,
     // index arrays and their construction copies; callers do not retain input row payloads.
-    constexpr uint64_t kWorkspaceBytes = 128ull * 1024 * 1024;
+    // A dense folder can exceed the former 128 MiB accounting ceiling at about 60k rows.
+    // Legacy callers charge up to 512 MiB; workspace callers page storage instead.
+    // Neither accounting mode is a preallocation or a process RSS limit.
+    constexpr uint64_t kWorkspaceBytes = 512ull * 1024 * 1024;
     constexpr uint64_t kMaxRows = 1000000;
     if (row_count > kMaxRows) {
         return make_error(ErrorKind::kUnsupported, "writer.tc.row_budget", row_count, kMaxRows,
@@ -184,8 +266,7 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
                           "a row is measured in the 16-bit rgib offsets ([MS-PST] 2.3.4.1)");
     }
 
-    std::vector<uint32_t> keys;
-    keys.reserve(static_cast<size_t>(row_count));
+    WorkArray<uint32_t> keys(scratch);
     auto read_row = [&](uint64_t index) -> Result<TcRow> {
         auto result = rows.read(index);
         if (!result.ok())
@@ -208,7 +289,10 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
                               row.present_empty.size(),
                               "presence flags must match the input columns");
         }
-        if (index < keys.size() && row.row_id != keys[static_cast<size_t>(index)]) {
+        const auto expected = index < keys.size() ? keys.get(index) : row.row_id;
+        if (!keys.status().ok())
+            return keys.status().error();
+        if (row.row_id != expected) {
             return make_error(ErrorKind::kBadField, "writer.tc.changed_row", index, row.row_id,
                               "row source changed while constructing its table");
         }
@@ -226,12 +310,20 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
     // the heap values are numbered after the Row Matrix is placed.
     const uint64_t cells = row_count * columns.size();
     uint64_t workspace = row_count * (row_size * 2 + columns.size() * 6 + 32);
-    if (workspace > kWorkspaceBytes) {
+    if (!scratch && workspace > kWorkspaceBytes) {
         return make_error(ErrorKind::kUnsupported, "writer.tc.workspace", workspace,
-                          kWorkspaceBytes, "table metadata exceeds the current workspace budget");
+                          kWorkspaceBytes,
+                          "table metadata exceeds the current workspace budget "
+                          "(required=" +
+                              std::to_string(workspace) +
+                              ", limit=" + std::to_string(kWorkspaceBytes) + " bytes)");
     }
-    std::vector<uint32_t> value_hid(cells, 0);
-    std::vector<char> value_in_subnode(cells, 0);
+    WorkArray<uint32_t> value_hid(scratch, cells);
+    WorkArray<uint8_t> value_in_subnode(scratch, cells);
+    if (!value_hid.status().ok())
+        return value_hid.status().error();
+    if (!value_in_subnode.status().ok())
+        return value_in_subnode.status().error();
     uint64_t heap_value_bytes = 0;
     uint64_t heap_values = 0;
     uint64_t subnode_values = 0;
@@ -252,18 +344,22 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
             }
             const auto source = cell_source(row, input);
             if (source && size > kTcHeapValueMaxBytes) {
-                value_in_subnode[row_index * columns.size() + column_index] = 1;
+                value_in_subnode.set(row_index * columns.size() + column_index, 1);
                 ++subnode_values;
                 continue;
             }
-            if (size > (kWorkspaceBytes - workspace) / 4) {
-                return make_error(ErrorKind::kUnsupported, "writer.tc.workspace", row_index, size,
-                                  "table values exceed the current workspace budget");
+            if (!scratch && size > (kWorkspaceBytes - workspace) / 4) {
+                return make_error(
+                    ErrorKind::kUnsupported, "writer.tc.workspace", row_index, size,
+                    "table values exceed the current workspace budget (used=" +
+                        std::to_string(workspace) + ", limit=" + std::to_string(kWorkspaceBytes) +
+                        ", value_bytes=" + std::to_string(size) + ", accounting_multiplier=4)");
             }
-            workspace += size * 4;
+            if (!scratch)
+                workspace += size * 4;
             const uint64_t cell = row_index * columns.size() + column_index;
             if (size > kTcHeapValueMaxBytes) {
-                value_in_subnode[cell] = 1;
+                value_in_subnode.set(cell, 1);
                 ++subnode_values;
                 continue;
             }
@@ -272,15 +368,21 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
         }
     }
 
-    std::vector<uint32_t> by_row_id(static_cast<size_t>(row_count));
+    WorkArray<RowKey> by_row_id(scratch, row_count);
     for (uint32_t index = 0; index < row_count; ++index)
-        by_row_id[index] = index;
-    std::sort(by_row_id.begin(), by_row_id.end(),
-              [&](uint32_t left, uint32_t right) { return keys[left] < keys[right]; });
+        by_row_id.set(index, {keys.get(index), index});
+    if (!keys.status().ok())
+        return keys.status().error();
+    auto sorted = sort_keys(by_row_id, scratch);
+    if (!sorted.ok())
+        return sorted.error();
     for (size_t index = 1; index < by_row_id.size(); ++index) {
-        if (keys[by_row_id[index - 1]] == keys[by_row_id[index]]) {
+        const auto left = by_row_id.get(index - 1).id, right = by_row_id.get(index).id;
+        if (!by_row_id.status().ok())
+            return by_row_id.status().error();
+        if (left == right) {
             return make_error(
-                ErrorKind::kBadField, "TCROWID.dwRowID", keys[by_row_id[index]], index,
+                ErrorKind::kBadField, "TCROWID.dwRowID", by_row_id.get(index).id, index,
                 "the RowIndex is keyed by dwRowID, so one row id cannot name two rows");
         }
     }
@@ -301,6 +403,7 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
                                                       matrix_bytes > kTcHeapValueMaxBytes);
 
     TcNode node;
+    node.heap.enable_spill(scratch);
     node.row_size =
         static_cast<uint16_t>(row_size); // [MS-PST] 2.3.4.1: rgib[TCI_bm] is the row size
     uint32_t matrix_nid = 0;
@@ -323,14 +426,17 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
         const TcRow& row = loaded.value();
         for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
             const uint64_t cell = row_index * columns.size() + column_index;
-            if (!value_in_subnode[cell]) {
+            const auto is_subnode = value_in_subnode.get(cell);
+            if (!value_in_subnode.status().ok())
+                return value_in_subnode.status().error();
+            if (!is_subnode) {
                 continue;
             }
             Result<uint32_t> nid = local_nids.take(ltp::kNidTypeLtp);
             if (!nid.ok()) {
                 return nid.error();
             }
-            value_hid[cell] = nid.value();
+            value_hid.set(cell, nid.value());
             node.subnodes.push_back(
                 LocalSubnode{nid.value(), row.values[columns[column_index].input_index],
                              cell_source(row, columns[column_index].input_index)});
@@ -390,14 +496,15 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
             const size_t count = std::min(kEntries, by_row_id.size() - begin);
             std::vector<uint8_t> records(count * ltp::kTcRowIdSize, 0);
             for (size_t index = 0; index < count; ++index) {
-                const uint32_t original = by_row_id[begin + index];
-                put_u32(records, index * ltp::kTcRowIdSize, keys[original]);
+                const auto key = by_row_id.get(begin + index);
+                const uint32_t original = key.original;
+                put_u32(records, index * ltp::kTcRowIdSize, key.id);
                 put_u32(records, index * ltp::kTcRowIdSize + ltp::kTcRowIdIndexOffset, original);
             }
             appended = node.heap.append(std::move(records));
             if (!appended.ok())
                 return appended.error();
-            level.emplace_back(keys[by_row_id[begin]], appended.value());
+            level.emplace_back(by_row_id.get(begin).id, appended.value());
         }
         while (level.size() > 1) {
             std::vector<std::pair<uint32_t, uint32_t>> parent;
@@ -434,8 +541,7 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
     }
 
     // The values that stayed in the heap follow the Row Matrix, in row order ([MS-PST] 2.3.4.4.2).
-    std::vector<std::pair<uint64_t, uint64_t>>
-        heap_cells; // cell -> the allocation holding its value
+    uint64_t heap_cells = 0;
     for (size_t row_index = 0; row_index < row_count; ++row_index) {
         auto loaded = read_row(row_index);
         if (!loaded.ok())
@@ -443,7 +549,10 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
         const TcRow& row = loaded.value();
         for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
             const uint64_t cell = row_index * columns.size() + column_index;
-            if (!columns[column_index].value_in_heap || value_in_subnode[cell]) {
+            const auto is_subnode = value_in_subnode.get(cell);
+            if (!value_in_subnode.status().ok())
+                return value_in_subnode.status().error();
+            if (!columns[column_index].value_in_heap || is_subnode) {
                 continue;
             }
             auto obtained =
@@ -458,28 +567,31 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
             if (!appended.ok()) {
                 return appended.error();
             }
-            heap_cells.emplace_back(cell, node.heap.allocation_count());
+            value_hid.set(cell, appended.value());
+            ++heap_cells;
         }
     }
-    if (heap_cells.size() != heap_values) {
-        return make_error(ErrorKind::kBadField, "writer.build_table", heap_cells.size(),
-                          heap_values,
+    if (heap_cells != heap_values) {
+        return make_error(ErrorKind::kBadField, "writer.build_table", heap_cells, heap_values,
                           "the writer placed a different number of heap values than it measured");
-    }
-    for (const std::pair<uint64_t, uint64_t>& placed : heap_cells) {
-        value_hid[placed.first] = node.heap.hid(placed.second);
     }
 
     if (row_count != 0) {
         // Every row is row_size bytes and space is reserved for a column whether or not its Cell
         // Existence Bit is set ([MS-PST] 2.3.4.4 / 2.3.4.4.1).
-        std::vector<uint8_t> matrix(matrix_bytes, 0);
+        std::vector<uint8_t> matrix(scratch && matrix_in_subnode ? 0 : matrix_bytes, 0);
+        auto matrix_spool =
+            scratch && matrix_in_subnode ? std::make_shared<util::SpillBuffer>(scratch) : nullptr;
+        std::vector<uint8_t> row_bytes(static_cast<size_t>(row_size));
         for (size_t row_index = 0; row_index < row_count; ++row_index) {
             auto loaded = read_row(row_index);
             if (!loaded.ok())
                 return loaded.error();
             const TcRow& row = loaded.value();
-            const uint64_t row_at = row_index * row_size;
+            const uint64_t row_at = matrix_spool ? 0 : row_index * row_size;
+            auto& output = matrix_spool ? row_bytes : matrix;
+            if (matrix_spool)
+                std::fill(row_bytes.begin(), row_bytes.end(), uint8_t{0});
             for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
                 const Column& column = columns[column_index];
                 const std::vector<uint8_t>& value = row.values[column.input_index];
@@ -490,8 +602,8 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
                     continue; // the Cell Existence Bit stays clear
                 }
                 if (column.value_in_heap) {
-                    put_u32(matrix, row_at + column.ib_data,
-                            value_hid[row_index * columns.size() + column_index]);
+                    put_u32(output, row_at + column.ib_data,
+                            value_hid.get(row_index * columns.size() + column_index));
                 } else {
                     auto obtained = small_cell(row, column.input_index, column.width);
                     if (!obtained.ok())
@@ -504,18 +616,27 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
                                 std::to_string(column.width) + " bytes ([MS-PST] 2.3.4.2)");
                     }
                     for (size_t byte = 0; byte < fixed.size(); ++byte) {
-                        matrix[static_cast<size_t>(row_at + column.ib_data) + byte] = fixed[byte];
+                        output[static_cast<size_t>(row_at + column.ib_data) + byte] = fixed[byte];
                     }
                 }
                 // [MS-PST] 2.3.4.4.1: iBit 0 is the MSB of rgCEB[0], then down to the LSB of that
                 // byte.
                 const uint64_t ceb_at = row_at + end1 + column.i_bit / 8;
-                matrix[static_cast<size_t>(ceb_at)] |=
+                output[static_cast<size_t>(ceb_at)] |=
                     static_cast<uint8_t>(1u << (7u - (column.i_bit % 8u)));
+            }
+            if (matrix_spool) {
+                auto written =
+                    matrix_spool->append(util::ByteView(row_bytes.data(), row_bytes.size()));
+                if (!written.ok())
+                    return written.error();
             }
         }
         if (matrix_in_subnode) {
-            node.subnodes[0].bytes = std::move(matrix);
+            if (matrix_spool)
+                node.subnodes[0].source = matrix_spool;
+            else
+                node.subnodes[0].bytes = std::move(matrix);
         } else {
             Status written = node.heap.patch(matrix_allocation, 0, matrix);
             if (!written.ok()) {
@@ -551,11 +672,15 @@ Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& column_specs,
         if (!patched.ok())
             return patched.error();
     }
+    for (auto status :
+         {keys.status(), by_row_id.status(), value_hid.status(), value_in_subnode.status()})
+        if (!status.ok())
+            return status.error();
     return node;
 }
 
 Result<TcNode> build_table(const std::vector<TcColumnSpec>& columns, const std::vector<TcRow>& rows,
-                           LocalNids& local_nids) {
+                           LocalNids& local_nids, std::shared_ptr<util::Workspace> workspace) {
     class VectorRows final : public TcRowSource {
       public:
         explicit VectorRows(const std::vector<TcRow>& rows) : rows_(rows) {}
@@ -567,7 +692,7 @@ Result<TcNode> build_table(const std::vector<TcColumnSpec>& columns, const std::
       private:
         const std::vector<TcRow>& rows_;
     } source(rows);
-    return build_table_from(columns, source, local_nids);
+    return build_table_from(columns, source, local_nids, std::move(workspace));
 }
 
 // The table a caller expects to fit one heap node. A table that needed a subnode is refused here

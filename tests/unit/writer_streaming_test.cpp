@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -46,11 +47,15 @@ class Sink final : public RandomAccessFile {
     bool fail_free_map = false;
     size_t fail_write = 0, writes = 0, flushes = 0, largest_write = 0;
     uint64_t eof = 0, high_offset = 0;
+    mutable size_t reads = 0;
+    size_t fail_read_call = 0;
     std::vector<uint8_t> bytes, high_block;
     std::map<uint64_t, std::vector<uint8_t>> fixed_maps;
     std::array<uint8_t, ndb::kHeaderSize> header{};
     uint64_t size() const override { return eof; }
     Status read_at(uint64_t at, uint8_t* data, size_t count) const override {
+        if (++reads == fail_read_call)
+            return make_error(ErrorKind::kIo, "injected.scratch_read", at, count);
         if (!materialize || at > bytes.size() || count > bytes.size() - at)
             return make_error(ErrorKind::kTruncated, "test.read", at, count);
         if (count)
@@ -111,6 +116,38 @@ std::vector<uint32_t> seeds() {
 }
 
 void check_equivalence_and_errors() {
+    {
+        GeneratedBlocks source;
+        source.total = 9000; // crosses both 4096-record descriptor windows
+        source.length = 16;
+        const auto nodes = nodes_for(source.total);
+        Sink reference, constrained;
+        auto baseline = write_store_to(source, nodes, seeds(), reference);
+        TEST_OK(baseline, "resident descriptor reference");
+        auto resources =
+            std::make_shared<Workspace>(std::filesystem::temp_directory_path().wstring(), 65536);
+        auto streamed = write_store_to(source, nodes, seeds(), constrained, resources);
+        TEST_OK(streamed, "spill block descriptors under a 64 KiB allowance");
+        TEST_CHECK(constrained.bytes == reference.bytes);
+        if (streamed.ok())
+            TEST_CHECK(streamed.value().blocks.empty());
+        TEST_CHECK(resources->spilled_bytes > 0);
+        TEST_CHECK(resources->memory->peak() <= 65536);
+        TEST_EQ(resources->memory->used(), 0u, "writer releases paged metadata");
+        auto failing =
+            std::make_shared<Workspace>(std::filesystem::temp_directory_path().wstring(), 0);
+        failing->scratch_factory = []() -> Result<std::shared_ptr<RandomAccessFile>> {
+            auto file = std::make_shared<Sink>();
+            file->capture_maps = false;
+            file->fail_read_call = 2;
+            return std::static_pointer_cast<RandomAccessFile>(file);
+        };
+        Sink refused;
+        TEST_ERROR(write_store_to(source, nodes, seeds(), refused, failing), ErrorKind::kIo,
+                   "injected.scratch_read",
+                   "paged descriptor read failure propagates before publication");
+        TEST_EQ(refused.flushes, 0u, "scratch error cannot produce a successful store");
+    }
     GeneratedBlocks source;
     const auto nodes = nodes_for(source.total);
     Sink output;

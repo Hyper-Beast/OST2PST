@@ -1,7 +1,9 @@
 // A Table Context is the shape every folder table is built out of, so this file builds one with the
 // writer and reads it back with the reader: ltp::read_tc, walk_tc_row_index and tc_column_cell over
 // a BlockHeapSource of the built block ([MS-PST] 2.3.4 / 2.3.4.3.1 / 2.3.4.4).
+#include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -13,6 +15,7 @@
 #include "ost2pst/ltp/tc.h"
 #include "ost2pst/ndb/report.h"
 #include "ost2pst/util/byte_view.h"
+#include "ost2pst/util/sha256.h"
 #include "ost2pst/util/status.h"
 #include "ost2pst/writer/heap.h"
 #include "ost2pst/writer/tc.h"
@@ -1008,6 +1011,179 @@ void check_writer_rejections() {
                "PidTagLtpRowId wider than the 4 bytes its ibData allows");
 }
 
+class DenseRows final : public ost2pst::writer::TcRowSource {
+  public:
+    uint32_t size = 69621;
+    size_t payload_size = 84;
+    mutable uint64_t calls = 0;
+    uint64_t count() const override { return size; }
+    static std::vector<uint8_t> payload(uint32_t row, uint32_t column, size_t size) {
+        std::vector<uint8_t> bytes(size, static_cast<uint8_t>(column + 0x40));
+        const auto identity = le32(row);
+        std::copy(identity.begin(), identity.end(), bytes.begin());
+        return bytes;
+    }
+    Result<TcRow> read(uint64_t index) const override {
+        ++calls;
+        const uint32_t id = 1000 + size - 1 - static_cast<uint32_t>(index);
+        TcRow row{id, {le32(id), le32(0)}};
+        for (uint32_t column = 0; column < 6; ++column)
+            row.values.push_back(payload(static_cast<uint32_t>(index), column, payload_size));
+        return row;
+    }
+};
+
+void check_dense_table_workspace() {
+    std::vector<TcColumnSpec> columns = {{0x67F20003}, {0x67F30003}};
+    for (uint32_t column = 0; column < 6; ++column)
+        columns.push_back({((0x5000 + column) << 16) | 0x0102});
+    DenseRows rows;
+    LocalNids nids;
+    auto built = ost2pst::writer::build_table_from(columns, rows, nids);
+    TEST_OK(built, "69,621 rows with dense values exceed the former 128 MiB accounting ceiling");
+    if (built.ok()) {
+        const auto& node = built.value();
+        TEST_EQ(node.subnodes.size(), 1u, "only the row matrix leaves the heap");
+        ImageHeapSource source(node.heap);
+        auto header = decode_hn_header(view_of(node.heap));
+        TEST_OK(header, "dense table heap header");
+        if (!header.ok())
+            return;
+        auto table = read_tc(header.value(), source);
+        TEST_OK(table, "reread dense table schema");
+        if (!table.ok() || node.subnodes.empty())
+            return;
+        BthStats stats;
+        FailureLog failures;
+        uint32_t seen = 0;
+        auto walked = ost2pst::ltp::walk_tc_row_index(
+            table.value(), kProfile, source,
+            [&](const TcRowId& row) {
+                TEST_EQ(row.row_id, 1000 + seen, "dense table sorted row ID");
+                TEST_EQ(row.row_index, rows.size - 1 - seen, "dense table original row position");
+                ++seen;
+                return true;
+            },
+            stats, failures);
+        TEST_OK(walked, "reread every dense table index entry");
+        TEST_EQ(seen, rows.size, "no rows omitted");
+        const auto& matrix = node.subnodes.front().bytes;
+        TEST_EQ(matrix.size(), static_cast<uint64_t>(rows.size) * node.row_size,
+                "complete dense row matrix");
+        for (uint32_t index = 0; index < rows.size; ++index) {
+            ByteView row(matrix.data() + static_cast<size_t>(index) * node.row_size, node.row_size,
+                         0);
+            for (uint32_t column = 0; column < 6; ++column) {
+                const auto tag = ((0x5000 + column) << 16) | 0x0102;
+                auto cell = tc_column_cell(
+                    table.value(), table.value().columns[column_of(table.value().columns, tag)],
+                    row);
+                TEST_OK(cell, "dense table cell survives");
+                if (!cell.ok())
+                    continue;
+                TEST_CHECK(cell.value().exists);
+                auto value = source.heap(cell.value().value.u32(0).value());
+                TEST_OK(value, "dense table value HID resolves");
+                if (value.ok())
+                    TEST_CHECK(bytes_of(value.value()) ==
+                               DenseRows::payload(index, column, rows.payload_size));
+            }
+        }
+        TEST_EQ(failures.total(), 0u, "no dense index failures");
+        TEST_EQ(rows.calls, 4ull * rows.size, "bounded repeatable passes");
+    }
+    DenseRows excessive;
+    excessive.payload_size = 3580;
+    LocalNids excessive_nids;
+    auto refused = ost2pst::writer::build_table_from(columns, excessive, excessive_nids);
+    TEST_ERROR(refused, ErrorKind::kUnsupported, "writer.tc.workspace",
+               "value accounting still bounded");
+    if (!refused.ok()) {
+        TEST_CHECK(refused.error().detail.find("limit=536870912") != std::string::npos);
+        TEST_CHECK(refused.error().detail.find("value_bytes=3580") != std::string::npos);
+    }
+    auto wide_columns = columns;
+    wide_columns.resize(2);
+    for (uint32_t column = 0; column < 253; ++column)
+        wide_columns.push_back({((0x4000 + column) << 16) | 0x0102});
+    GeneratedRows wide(1000000);
+    LocalNids wide_nids;
+    TEST_ERROR(ost2pst::writer::build_table_from(wide_columns, wide, wide_nids),
+               ErrorKind::kUnsupported, "writer.tc.workspace", "metadata accounting still bounded");
+    TEST_EQ(wide.calls, 0u, "metadata limit checked before reading row values");
+    DenseRows too_many;
+    too_many.size = 1000001;
+    LocalNids too_many_nids;
+    TEST_ERROR(ost2pst::writer::build_table_from(columns, too_many, too_many_nids),
+               ErrorKind::kUnsupported, "writer.tc.row_budget", "row ceiling still bounded");
+    TEST_EQ(too_many.calls, 0u, "reject row limit before reading values");
+}
+
+void check_spilled_table() {
+    std::vector<TcColumnSpec> columns = {{0x67F20003}, {0x67F30003}};
+    for (uint32_t column = 0; column < 6; ++column)
+        columns.push_back({((0x5000 + column) << 16) | 0x0102});
+    DenseRows rows;
+    rows.size = 9000; // multiple external-sort runs, reverse row IDs
+    LocalNids reference_nids;
+    auto reference = ost2pst::writer::build_table_from(columns, rows, reference_nids);
+    TEST_OK(reference, "resident reference table");
+    if (!reference.ok())
+        return;
+    auto resources = std::make_shared<ost2pst::util::Workspace>(
+        std::filesystem::temp_directory_path().wstring(), 1024 * 1024);
+    {
+        LocalNids paged_nids;
+        auto paged = ost2pst::writer::build_table_from(columns, rows, paged_nids, resources);
+        TEST_OK(paged, "same table fits a one MiB shared cache by spilling");
+        if (!paged.ok())
+            return;
+        size_t block = 0;
+        TEST_OK(paged.value().heap.stream_blocks([&](ByteView bytes) -> Status {
+            TEST_CHECK(block < reference.value().heap.blocks().size());
+            if (block < reference.value().heap.blocks().size())
+                TEST_CHECK(bytes_of(bytes) == reference.value().heap.blocks()[block]);
+            ++block;
+            return {};
+        }),
+                "stream every heap block and compare exact bytes");
+        TEST_EQ(block, reference.value().heap.block_count(), "same heap packing");
+        TEST_EQ(paged.value().hnid_rows, reference.value().hnid_rows, "same matrix NID");
+        TEST_EQ(paged.value().subnodes.size(), reference.value().subnodes.size(), "same subnodes");
+        TEST_CHECK(paged.value().subnodes[0].bytes.empty());
+        const auto source = paged.value().subnodes[0].source;
+        TEST_CHECK(source);
+        if (source) {
+            std::vector<uint8_t> actual(static_cast<size_t>(source->size()));
+            TEST_OK(source->read_at(0, actual.data(), actual.size()), "spooled matrix");
+            TEST_CHECK(actual == reference.value().subnodes[0].bytes);
+        }
+        TEST_CHECK(resources->spilled_bytes > 0);
+        TEST_CHECK(resources->memory->peak() <= resources->memory->limit());
+    }
+    TEST_EQ(resources->memory->used(), 0u, "returned table releases all spill leases");
+    // Same valid table refused by the legacy 512 MiB cumulative-copy accounting.
+    // Its actual payload is ~143 MiB and can be processed with a one MiB cache.
+    DenseRows large;
+    large.size = 7000;
+    large.payload_size = 3580;
+    LocalNids old_nids;
+    TEST_ERROR(ost2pst::writer::build_table_from(columns, large, old_nids), ErrorKind::kUnsupported,
+               "writer.tc.workspace", "reproduce fixed ceiling");
+    LocalNids spill_nids;
+    auto large_table = ost2pst::writer::build_table_from(columns, large, spill_nids, resources);
+    TEST_OK(large_table, "table exceeding old accounting limit streams with small cache");
+    if (large_table.ok()) {
+        uint64_t count = 0;
+        TEST_OK(large_table.value().heap.stream_blocks([&](ByteView) -> Status {
+            ++count;
+            return {};
+        }),
+                "all large table heap blocks readable");
+        TEST_EQ(count, large_table.value().heap.block_count(), "no emitted blocks lost");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1020,5 +1196,7 @@ int main() {
     check_large_row_index();
     check_streamed_row_index();
     check_writer_rejections();
+    check_dense_table_workspace();
+    check_spilled_table();
     return ost2pst::test::finish("writer_tc_test");
 }

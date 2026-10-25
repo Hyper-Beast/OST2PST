@@ -6,6 +6,7 @@
 #include "ost2pst/util/file_writer.h"
 #include "ost2pst/util/status.h"
 #include "ost2pst/util/value_spool.h"
+#include "ost2pst/util/workspace.h"
 
 namespace ost2pst::writer {
 
@@ -94,10 +95,13 @@ class StoreBlockSource {
 
 // Emits to an initially empty owned file with bounded I/O buffers. Returned bytes is empty;
 // file_bytes and block/layout metadata describe the output. Flush succeeds before return.
+// With a workspace, descriptors spill and the optional returned blocks vector is
+// omitted; file_bytes/layout totals and the written BBT remain authoritative.
 util::Result<StoreImage> write_store_to(const StoreBlockSource& blocks,
                                         const std::vector<StoreNode>& nodes,
                                         const std::vector<uint32_t>& rgnid,
-                                        util::RandomAccessFile& output);
+                                        util::RandomAccessFile& output,
+                                        std::shared_ptr<util::Workspace> workspace = {});
 
 // Lays a plan out as a complete Unicode 512-byte-page PST: data blocks with trailers, one SLBLOCK
 // per node that has subnodes, one XBLOCK per node whose data needs more than one block, the BBT and

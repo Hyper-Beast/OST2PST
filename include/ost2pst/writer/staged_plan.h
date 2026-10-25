@@ -36,25 +36,32 @@ struct StagedPlan {
 // Validation precedes begin(); successful return means the complete outcome is durable.
 util::Status stage_plan(StagingJournal& journal, const util::Sha256Digest& key,
                         StagedOutcome outcome, const StorePlan& plan, const StagedDetails& details,
-                        const CommitObserver& observer = {});
-util::Result<StagedPlan> read_staged_plan(const StagingJournal& journal, size_t record);
+                        const CommitObserver& observer = {},
+                        std::shared_ptr<util::Workspace> workspace = {});
+// With a workspace, row values are bounded journal-backed sources. The journal
+// must outlive the returned plan/rows, as for StagedRows and assembly itself.
+util::Result<StagedPlan> read_staged_plan(const StagingJournal& journal, size_t record,
+                                          std::shared_ptr<util::Workspace> workspace = {});
 
 class StagedRows final : public TcRowSource {
   public:
-    StagedRows(const StagingJournal& journal, std::vector<size_t> records)
-        : journal_(journal), records_(std::move(records)) {}
+    StagedRows(const StagingJournal& journal, std::vector<size_t> records,
+               std::shared_ptr<util::Workspace> workspace = {})
+        : journal_(journal), records_(std::move(records)), workspace_(std::move(workspace)) {}
     uint64_t count() const override { return records_.size(); }
     util::Result<TcRow> read(uint64_t index) const override;
 
   private:
     const StagingJournal& journal_;
     std::vector<size_t> records_;
+    std::shared_ptr<util::Workspace> workspace_;
 };
 
 struct StagedAssemblyOptions {
     // Fixed-size lookup budget, not a format limit. Zero preserves unshared assembly.
     // After filling the index, new contents remain unshared; existing entries stay usable.
     uint32_t sharing_entries = 524288;
+    std::shared_ptr<util::Workspace> workspace;
 };
 
 struct StagedAssemblyStats {

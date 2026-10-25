@@ -59,10 +59,16 @@ struct TcNode {
 // ([MS-PST] 2.6.1.2.2: subnode NIDs are not allocated from HEADER.rgnid) and is only used when
 // something leaves the heap.
 util::Result<TcNode> build_table(const std::vector<TcColumnSpec>& columns,
-                                 const std::vector<TcRow>& rows, LocalNids& local_nids);
+                                 const std::vector<TcRow>& rows, LocalNids& local_nids,
+                                 std::shared_ptr<util::Workspace> workspace = {});
 
+// Input rows are read one at a time. With a workspace, table storage shares its
+// memory pool and spills to disk. Legacy callers without one retain the 512 MiB
+// cumulative copy-accounting ceiling. Both modes enforce one million rows and
+// format limits, returning unsupported without a partial result on overflow.
 util::Result<TcNode> build_table_from(const std::vector<TcColumnSpec>& columns,
-                                      const TcRowSource& rows, LocalNids& local_nids);
+                                      const TcRowSource& rows, LocalNids& local_nids,
+                                      std::shared_ptr<util::Workspace> workspace = {});
 
 // The common case for a table small enough for one heap node: build_table with a supply of its own,
 // and the heap image alone. A table that needs a subnode is refused here rather than silently

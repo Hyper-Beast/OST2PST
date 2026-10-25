@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 #include "ost2pst/util/crc32.h"
@@ -436,6 +437,67 @@ void check_more_than_one_million_blocks() {
         }
     }
 }
+class PatternSource final : public ByteSource {
+  public:
+    uint64_t size() const override { return 40ull * 1024 * 1024 + 17; }
+    mutable size_t max_read = 0;
+    Status read_at(uint64_t offset, uint8_t* data, size_t count) const override {
+        max_read = std::max(max_read, count);
+        if (offset > size() || count > size() - offset)
+            return make_error(ErrorKind::kTruncated, "test.pattern_range", offset, count);
+        for (size_t index = 0; index < count; ++index)
+            data[index] = static_cast<uint8_t>((offset + index) * 17 + (offset + index) / 251);
+        return {};
+    }
+};
+void check_streamed_record_metadata() {
+    auto resources =
+        std::make_shared<Workspace>(std::filesystem::temp_directory_path().wstring(), 1024 * 1024);
+    auto pattern = std::make_shared<PatternSource>();
+    MemoryFile data, log;
+    auto made = StagingJournal::create(data, log, key(98));
+    TEST_OK(made, "metadata journal");
+    if (!made.ok())
+        return;
+    auto journal = made.take();
+    auto plan = item_plan();
+    StagedDetails details;
+    details.row = TcRow{plan.nodes[0].nid, {{}, {}}, {false, true}, {pattern, {}}};
+    details.json = "{\"synthetic\":true}";
+    TEST_ERROR(stage_plan(journal, key(1), StagedOutcome::kConverted, plan, details),
+               ErrorKind::kBadField, "staged_plan.metadata_budget",
+               "old 32 MiB resident metadata limit");
+    TEST_EQ(journal.records().size(), 0u, "refusal precedes transaction begin");
+    TEST_OK(stage_plan(journal, key(1), StagedOutcome::kConverted, plan, details, {}, resources),
+            "large row metadata spills before commit");
+    TEST_EQ(journal.records().size(), 1u, "one durable outcome");
+    data.max_read = 0;
+    auto decoded = read_staged_plan(journal, 0, resources);
+    TEST_OK(decoded, "large committed metadata decoded through windows");
+    if (decoded.ok()) {
+        const auto& row = *decoded.value().details.row;
+        TEST_CHECK(row.values[0].empty());
+        TEST_CHECK(row.sources[0] && row.sources[0]->size() == pattern->size());
+        TEST_CHECK(row.present_empty[1]);
+        TEST_CHECK(decoded.value().details.json == details.json);
+        std::array<uint8_t, 8192> actual{}, expected{};
+        for (uint64_t offset = 0; offset < pattern->size(); offset += actual.size()) {
+            const auto count =
+                static_cast<size_t>(std::min<uint64_t>(actual.size(), pattern->size() - offset));
+            TEST_OK(row.sources[0]->read_at(offset, actual.data(), count), "reread metadata value");
+            TEST_OK(pattern->read_at(offset, expected.data(), count), "expected metadata value");
+            TEST_CHECK(std::equal(actual.begin(), actual.begin() + count, expected.begin()));
+        }
+    }
+    TEST_CHECK(data.max_read <= 8192);
+    TEST_CHECK(pattern->max_read <= 8192);
+    TEST_CHECK(resources->spilled_bytes > 32ull * 1024 * 1024);
+    TEST_CHECK(resources->memory->peak() <= resources->memory->limit());
+    TEST_EQ(resources->memory->used(), 0u, "encoded metadata scratch released");
+    data.fail_read = true;
+    TEST_ERROR(read_staged_plan(journal, 0, resources), ErrorKind::kIo, "test.read",
+               "late metadata I/O remains fatal");
+}
 } // namespace
 
 int main() {
@@ -446,5 +508,6 @@ int main() {
     check_validation_and_io();
     check_bad_metadata();
     check_streamed_payload_failure();
+    check_streamed_record_metadata();
     return ost2pst::test::finish("writer_staged_plan_test");
 }

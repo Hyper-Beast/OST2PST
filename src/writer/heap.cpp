@@ -1,5 +1,7 @@
 #include "ost2pst/writer/heap.h"
 
+#include <array>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -56,6 +58,51 @@ uint8_t fill_level(uint64_t used) {
 
 } // namespace
 
+struct HeapImage::DiskHeap {
+    struct Record {
+        uint64_t offset;
+        uint32_t size;
+        uint32_t hid;
+    };
+    explicit DiskHeap(std::shared_ptr<util::Workspace> workspace)
+        : workspace(workspace), records(workspace),
+          values(std::make_shared<util::SpillBuffer>(workspace)) {}
+    std::shared_ptr<util::Workspace> workspace;
+    util::SpillArray<Record> records;
+    std::shared_ptr<util::SpillBuffer> values;
+};
+
+void HeapImage::enable_spill(std::shared_ptr<util::Workspace> workspace) {
+    if (workspace && allocation_count() == 0)
+        disk_ = std::make_shared<DiskHeap>(std::move(workspace));
+}
+Status HeapImage::detach() {
+    if (!disk_ || disk_.use_count() == 1)
+        return {};
+    auto copy = std::make_shared<DiskHeap>(disk_->workspace);
+    std::array<uint8_t, 8192> bytes{};
+    for (uint64_t offset = 0; offset < disk_->values->size();) {
+        const auto count =
+            static_cast<size_t>(std::min<uint64_t>(bytes.size(), disk_->values->size() - offset));
+        auto read = disk_->values->read_at(offset, bytes.data(), count);
+        if (!read.ok())
+            return read;
+        auto appended = copy->values->append(util::ByteView(bytes.data(), count));
+        if (!appended.ok())
+            return appended;
+        offset += count;
+    }
+    for (uint64_t index = 0; index < disk_->records.size(); ++index) {
+        auto appended = copy->records.push_back(disk_->records.get(index));
+        if (!disk_->records.status().ok())
+            return disk_->records.status();
+        if (!appended.ok())
+            return appended;
+    }
+    disk_ = std::move(copy);
+    return {};
+}
+
 HeapImage::HeapImage(uint8_t client_sig) : client_sig_(client_sig) {
     // [MS-PST] 2.3.1.6.1: a heap node always has its first data block, even before anything is
     // allocated from it, and the allocations start right after the 12-byte HNHDR.
@@ -64,6 +111,11 @@ HeapImage::HeapImage(uint8_t client_sig) : client_sig_(client_sig) {
 }
 
 uint32_t HeapImage::hid(uint64_t index) const {
+    if (disk_) {
+        if (index < 1 || index > disk_->records.size())
+            return 0;
+        return disk_->records.get(index - 1).hid;
+    }
     if (index < 1 || index > placement_.size()) {
         return 0;
     }
@@ -72,7 +124,7 @@ uint32_t HeapImage::hid(uint64_t index) const {
 }
 
 uint64_t HeapImage::allocation_count() const {
-    return allocations_.size();
+    return disk_ ? disk_->records.size() : allocations_.size();
 }
 
 uint64_t HeapImage::block_count() const {
@@ -120,6 +172,9 @@ bool HeapImage::block_accepts(uint64_t block, uint64_t size) const {
 }
 
 Result<uint32_t> HeapImage::append(std::vector<uint8_t> bytes) {
+    auto unique = detach();
+    if (!unique.ok())
+        return unique.error();
     // [MS-PST] 2.3.1.5 sizes an allocation as rgibAlloc[n + 1] - rgibAlloc[n], and
     // ltp::hn_allocation refuses an allocation of zero bytes, so an empty item is a writer bug, not
     // a shape to emit.
@@ -140,6 +195,12 @@ Result<uint32_t> HeapImage::append(std::vector<uint8_t> bytes) {
                 "one allocation larger than a data block can hold ([MS-PST] 2.3.1.1 / 2.3.1.2)");
         }
         block = block_alloc_end_.size();
+        // Existing Unicode HID geometry: the block index must fit before it is
+        // shifted into a 32-bit HID. Spilling must never turn this into wraparound.
+        if (block >= ltp::kDataTreeMaxBlocks512)
+            return make_error(ErrorKind::kUnsupported, "writer.heap.block_index", block,
+                              ltp::kDataTreeMaxBlocks512,
+                              "heap exceeds the Unicode HID block-index capacity");
         block_alloc_end_.push_back(ltp::hn_block_header_size(block));
         block_slots_.push_back(0);
         if (!block_accepts(block, bytes.size())) {
@@ -153,13 +214,29 @@ Result<uint32_t> HeapImage::append(std::vector<uint8_t> bytes) {
     const uint64_t slot = block_slots_[static_cast<size_t>(block)] + 1;
     block_alloc_end_[static_cast<size_t>(block)] += bytes.size();
     block_slots_[static_cast<size_t>(block)] = slot;
-    allocations_.push_back(std::move(bytes));
-    placement_.emplace_back(block, slot);
+    if (disk_) {
+        const auto offset = disk_->values->size();
+        auto stored = disk_->values->append(util::ByteView(bytes.data(), bytes.size()));
+        if (!stored.ok())
+            return stored.error();
+        stored = disk_->records.push_back(
+            {offset, static_cast<uint32_t>(bytes.size()), hid_of(block, slot)});
+        if (!stored.ok())
+            return stored.error();
+    } else {
+        allocations_.push_back(std::move(bytes));
+        placement_.emplace_back(block, slot);
+    }
     dirty_ = true;
     return hid_of(block, slot);
 }
 
 Status HeapImage::patch(uint64_t index, uint64_t offset, uint32_t value) {
+    if (disk_) {
+        std::vector<uint8_t> bytes(4);
+        put_u32(bytes, 0, value);
+        return patch(index, offset, bytes);
+    }
     if (index < 1 || index > allocations_.size()) {
         return make_error(ErrorKind::kBadField, "writer.HeapImage.patch", index,
                           allocations_.size(), "no allocation with that index to patch");
@@ -175,6 +252,22 @@ Status HeapImage::patch(uint64_t index, uint64_t offset, uint32_t value) {
 }
 
 Status HeapImage::patch(uint64_t index, uint64_t offset, const std::vector<uint8_t>& bytes) {
+    if (disk_) {
+        auto unique = detach();
+        if (!unique.ok())
+            return unique;
+        if (index < 1 || index > disk_->records.size())
+            return make_error(ErrorKind::kBadField, "writer.HeapImage.patch", index,
+                              allocation_count());
+        const auto record = disk_->records.get(index - 1);
+        if (!disk_->records.status().ok())
+            return disk_->records.status();
+        if (offset > record.size || bytes.size() > record.size - offset)
+            return make_error(ErrorKind::kBadField, "writer.HeapImage.patch", offset, record.size);
+        dirty_ = true;
+        return disk_->values->write_at(record.offset + offset,
+                                       util::ByteView(bytes.data(), bytes.size()));
+    }
     if (index < 1 || index > allocations_.size()) {
         return make_error(ErrorKind::kBadField, "writer.HeapImage.patch", index,
                           allocations_.size(), "no allocation with that index to patch");
@@ -207,62 +300,95 @@ const std::vector<std::vector<uint8_t>>& HeapImage::blocks() const {
     return blocks_;
 }
 
+Result<std::vector<uint8_t>> HeapImage::build_block(size_t block, uint64_t& allocation) const {
+    const uint64_t header = ltp::hn_block_header_size(block);
+    const uint64_t slots = block_slots_[block];
+    const uint64_t ib_hnpm = block_ib_hnpm(block);
+    const uint64_t cb = ib_hnpm + page_map_bytes(slots);
+    // Outlook keeps every nonfinal HN leaf at full data capacity, including after freeing
+    // almost all its items (research/m5-heap-compatibility.md). Shrinking these leaves made
+    // Outlook grow the page map past their BBT cb on its first table update. The reserved tail
+    // is free space inside cb, not a heap allocation or NDB alignment padding.
+    const uint64_t stored_cb =
+        block + 1 < block_alloc_end_.size() ? ndb::block_max_cb(kProfile) : cb;
+    std::vector<uint8_t> image(stored_cb, 0);
+    put_u16(image, ltp::kHnIbHnpmOffset, static_cast<uint16_t>(ib_hnpm));
+    if (block == 0) {
+        // [MS-PST] 2.3.1.2: only the first data block of an HN carries the bSig, bClientSig and
+        // hidUserRoot of the HNHDR; the rest carry ibHnpm alone, or ibHnpm plus a Fill Level
+        // Map.
+        image[ltp::kHnSigOffset] = ltp::kHnSignature;
+        image[ltp::kHnClientSigOffset] = client_sig_;
+        put_u32(image, ltp::kHnUserRootOffset, hid(1));
+    }
+    // Fill maps are populated after all block headers exist; absent slots stay zero.
+
+    uint64_t at = header;
+    for (uint64_t slot = 1; slot <= slots; ++slot, ++allocation) {
+        uint64_t item_size = 0;
+        if (disk_) {
+            const auto record = disk_->records.get(allocation);
+            if (!disk_->records.status().ok())
+                return disk_->records.status().error();
+            item_size = record.size;
+            auto read = disk_->values->read_at(record.offset, image.data() + at, record.size);
+            if (!read.ok())
+                return read.error();
+        } else {
+            const auto& item = allocations_[static_cast<size_t>(allocation)];
+            item_size = item.size();
+            std::copy(item.begin(), item.end(), image.begin() + static_cast<size_t>(at));
+        }
+        // [MS-PST] 2.3.1.5: rgibAlloc[n] is the start of the (n + 1)th allocation of this
+        // block.
+        put_u16(image, ib_hnpm + ltp::kHnPageMapTableOffset + (slot - 1) * ltp::kHnPageMapEntrySize,
+                static_cast<uint16_t>(at));
+        at += item_size;
+    }
+    put_u16(image, ib_hnpm + ltp::kHnPageMapCAllocOffset, static_cast<uint16_t>(slots));
+    // cFree stays zero: the writer never frees a heap item.
+    // [MS-PST] 2.3.1.5: the entry past the last allocation marks the next available slot, which
+    // is before any alignment gap preceding the HNPAGEMAP.
+    put_u16(image, ib_hnpm + ltp::kHnPageMapTableOffset + slots * ltp::kHnPageMapEntrySize,
+            static_cast<uint16_t>(at));
+    // Fill maps can be derived from placement without building every block image.
+    const size_t first = block == 0 ? 0 : block;
+    const size_t limit = block == 0 ? std::min<size_t>(8, block_count())
+                                    : (block >= 8 && (block - 8) % 128 == 0
+                                           ? std::min<size_t>(block + 128, block_count())
+                                           : block);
+    for (size_t child = first; child < limit; ++child) {
+        // [MS-PST] 2.3.1.2 / 2.3.1.4: 8 slots in HNHDR, then 128 per HNBITMAPHDR.
+        const size_t slot = child < 8 ? child : (child - 8) % 128;
+        const size_t offset = (block == 0 ? 8 : 2) + slot / 2;
+        const uint64_t used = block_ib_hnpm(child) + page_map_bytes(block_slots_[child]);
+        image[offset] |= static_cast<uint8_t>(fill_level(used) << (4 * (slot % 2)));
+    }
+    return image;
+}
+Status HeapImage::stream_blocks(const util::ByteConsumer& consume) const {
+    uint64_t allocation = 0;
+    for (size_t block = 0; block < block_count(); ++block) {
+        auto built = build_block(block, allocation);
+        if (!built.ok())
+            return built.error();
+        const auto& bytes = built.value();
+        auto accepted = consume(util::ByteView(bytes.data(), bytes.size()));
+        if (!accepted.ok())
+            return accepted;
+    }
+    return {};
+}
 std::vector<std::vector<uint8_t>> HeapImage::build() const {
     std::vector<std::vector<uint8_t>> blocks;
-    blocks.reserve(block_alloc_end_.size());
-    size_t allocation = 0; // append order, which is also block order and slot order
-    for (size_t block = 0; block < block_alloc_end_.size(); ++block) {
-        const uint64_t header = ltp::hn_block_header_size(block);
-        const uint64_t slots = block_slots_[block];
-        const uint64_t ib_hnpm = block_ib_hnpm(block);
-        const uint64_t cb = ib_hnpm + page_map_bytes(slots);
-        // Outlook keeps every nonfinal HN leaf at full data capacity, including after freeing
-        // almost all its items (research/m5-heap-compatibility.md). Shrinking these leaves made
-        // Outlook grow the page map past their BBT cb on its first table update. The reserved tail
-        // is free space inside cb, not a heap allocation or NDB alignment padding.
-        const uint64_t stored_cb =
-            block + 1 < block_alloc_end_.size() ? ndb::block_max_cb(kProfile) : cb;
-        std::vector<uint8_t> image(stored_cb, 0);
-        put_u16(image, ltp::kHnIbHnpmOffset, static_cast<uint16_t>(ib_hnpm));
-        if (block == 0) {
-            // [MS-PST] 2.3.1.2: only the first data block of an HN carries the bSig, bClientSig and
-            // hidUserRoot of the HNHDR; the rest carry ibHnpm alone, or ibHnpm plus a Fill Level
-            // Map.
-            image[ltp::kHnSigOffset] = ltp::kHnSignature;
-            image[ltp::kHnClientSigOffset] = client_sig_;
-            put_u32(image, ltp::kHnUserRootOffset, hid(1));
-        }
-        // Fill maps are populated after all block headers exist; absent slots stay zero.
-
-        uint64_t at = header;
-        for (uint64_t slot = 1; slot <= slots; ++slot, ++allocation) {
-            const std::vector<uint8_t>& item = allocations_[allocation];
-            for (size_t byte = 0; byte < item.size(); ++byte) {
-                image[static_cast<size_t>(at) + byte] = item[byte];
-            }
-            // [MS-PST] 2.3.1.5: rgibAlloc[n] is the start of the (n + 1)th allocation of this
-            // block.
-            put_u16(image,
-                    ib_hnpm + ltp::kHnPageMapTableOffset + (slot - 1) * ltp::kHnPageMapEntrySize,
-                    static_cast<uint16_t>(at));
-            at += item.size();
-        }
-        put_u16(image, ib_hnpm + ltp::kHnPageMapCAllocOffset, static_cast<uint16_t>(slots));
-        // cFree stays zero: the writer never frees a heap item.
-        // [MS-PST] 2.3.1.5: the entry past the last allocation marks the next available slot, which
-        // is before any alignment gap preceding the HNPAGEMAP.
-        put_u16(image, ib_hnpm + ltp::kHnPageMapTableOffset + slots * ltp::kHnPageMapEntrySize,
-                static_cast<uint16_t>(at));
-        blocks.push_back(std::move(image));
-    }
-    for (size_t block = 0; block < blocks.size(); ++block) {
-        // [MS-PST] 2.3.1.2 / 2.3.1.4: 8 slots in HNHDR, then 128 per HNBITMAPHDR.
-        const size_t owner = block < 8 ? 0 : 8 + ((block - 8) / 128) * 128;
-        const size_t slot = block < 8 ? block : (block - 8) % 128;
-        const size_t offset = (owner == 0 ? 8 : 2) + slot / 2;
-        const uint64_t used = block_ib_hnpm(block) + page_map_bytes(block_slots_[block]);
-        blocks[owner][offset] |= static_cast<uint8_t>(fill_level(used) << (4 * (slot % 2)));
-    }
+    auto result = stream_blocks([&](util::ByteView bytes) -> Status {
+        blocks.emplace_back(bytes.data(), bytes.data() + bytes.size());
+        return {};
+    });
+    // Legacy materialization is used only by in-memory callers. Production spill
+    // consumers use stream_blocks and propagate its Status directly.
+    if (!result.ok())
+        throw std::runtime_error(util::format_error(result.error()));
     return blocks;
 }
 

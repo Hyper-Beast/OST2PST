@@ -250,7 +250,7 @@ util::Result<PreparedItem> prepare_item(const ltp::LtpReadReport& census, ltp::B
         return result;
     }
     auto built = writer::build_item_plan(emission.message, item.output_nid, item.output_parent,
-                                         registry.entries().size());
+                                         registry.entries().size(), options.workspace);
     if (!built.ok())
         return built.error();
     auto plan = built.take();

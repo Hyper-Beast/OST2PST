@@ -134,6 +134,7 @@ struct SubsetOptions {
     // a folder with fewer attachments.
     uint32_t max_embedded_depth = 4;
     util::ValueSpool* spool = nullptr; // optional one-item owner; legacy adapters retain vectors
+    std::shared_ptr<util::Workspace> workspace; // shared spill storage used by the writer too
     // Cumulative metadata/HN/matrix reservations when spooling; payload budget is separate.
     // Charged on demand, including conservative construction/copy multipliers. A whole
     // embedded-message tree shares this ceiling; this is neither preallocation nor RSS.

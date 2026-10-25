@@ -164,6 +164,8 @@ std::vector<uint8_t> slblock_bytes(const std::vector<SlEntrySpec>& entries) {
 // the leaf BBTENTRY itself, an NBTENTRY bidData/bidSub, an SLENTRY bidData/bidSub, and an XBLOCK
 // rgbid slot; cRef is 1 + those references.
 struct BlockState {
+    explicit BlockState(std::shared_ptr<util::Workspace> workspace = {})
+        : blocks(std::move(workspace)) {}
     // External blocks carry no vector/allocation; only generated internal blocks own bytes.
     // Fixed chunks avoid doubling the index when internal blocks are appended.
     BlockIndex<BlockRecord> blocks;
@@ -358,24 +360,25 @@ struct PageSpec {
 
 // Leaf pages first, then a level of index pages over them, repeating until one page is left
 // ([MS-PST] 2.2.2.7.7.1 / 2.2.2.7.7.2). The keys have to arrive sorted.
+template <class Key>
 Result<std::vector<std::vector<PageSpec>>> build_levels(uint8_t ptype, uint8_t cb_ent,
-                                                        const std::vector<uint64_t>& keys) {
-    if (keys.empty()) {
-        return make_error(ErrorKind::kBadField, "writer.store.btree_empty", keys.size(), 0,
+                                                        uint64_t key_count, Key key) {
+    if (key_count == 0) {
+        return make_error(ErrorKind::kBadField, "writer.store.btree_empty", key_count, 0,
                           "a BTree with no entries has no root page");
     }
     const uint8_t leaf_max = static_cast<uint8_t>(ndb::bt_entries_bytes(kProfile) / cb_ent);
     const uint8_t index_max =
         static_cast<uint8_t>(ndb::bt_entries_bytes(kProfile) / ndb::kBtEntrySize);
     std::vector<PageSpec> leaves;
-    for (uint64_t start = 0; start < keys.size(); start += leaf_max) {
-        const uint64_t count = std::min<uint64_t>(leaf_max, keys.size() - start);
+    for (uint64_t start = 0; start < key_count; start += leaf_max) {
+        const uint64_t count = std::min<uint64_t>(leaf_max, key_count - start);
         PageSpec page;
         page.ptype = ptype;
         page.c_level = 0;
         page.cb_ent = cb_ent;
         page.c_ent_max = leaf_max;
-        page.first_key = keys[start];
+        page.first_key = key(start);
         page.entry_start = start;
         page.entry_count = count;
         leaves.push_back(std::move(page));
@@ -472,7 +475,8 @@ uint64_t take_range(const std::vector<ReservedRange>& reserved, uint64_t cursor,
 Result<StoreImage> write_store_to(const StoreBlockSource& source,
                                   const std::vector<StoreNode>& nodes,
                                   const std::vector<uint32_t>& rgnid,
-                                  util::RandomAccessFile& output) {
+                                  util::RandomAccessFile& output,
+                                  std::shared_ptr<util::Workspace> workspace) {
     if (output.size() != 0)
         return make_error(ErrorKind::kBadField, "writer.store.output_not_empty", 0, output.size());
     if (rgnid.size() != ndb::kRgnidCount) {
@@ -482,7 +486,7 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
 
     // The caller's data blocks first, in the order it listed them, then the jump tables and subnode
     // lists the emitter has to add. [MS-PST] 2.2.2.1 gives each the next BID in steps of 4.
-    BlockState state;
+    BlockState state(workspace);
     // Explicit aggregate metadata capacities, independent of the per-record graph budget.
     if (source.count() > kStoreMaxBlocks || nodes.size() > kStoreMaxNodes)
         return make_error(ErrorKind::kUnsupported, "writer.store.metadata_budget", 0,
@@ -494,6 +498,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
         if (size.value() > ndb::kPstBlockMaxCb)
             return make_error(ErrorKind::kBadField, "writer.store.block_size", index, size.value());
         state.external(index, size.value());
+        if (!state.blocks.status().ok())
+            return state.blocks.status().error();
     }
     state.external_count = state.blocks.size();
     std::vector<std::pair<uint64_t, uint64_t>> node_slots;
@@ -501,6 +507,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
     for (const StoreNode& node : nodes) {
         Result<std::pair<uint64_t, uint64_t>> slots =
             emit_tree(state, node.data_blocks, node.subnodes);
+        if (!state.blocks.status().ok())
+            return state.blocks.status().error();
         if (!slots.ok()) {
             return slots.error();
         }
@@ -508,6 +516,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
     }
     for (size_t slot = 0; slot < state.blocks.size(); ++slot) {
         BlockRecord& block = state.blocks[slot];
+        if (!state.blocks.status().ok())
+            return state.blocks.status().error();
         if (block.references == 0 || block.references >= UINT16_MAX)
             return make_error(ErrorKind::kBadField, "writer.store.c_ref", slot, block.references);
         block.c_ref = static_cast<uint16_t>(1 + block.references);
@@ -523,12 +533,6 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
     std::sort(nbt_order.begin(), nbt_order.end(), [&](uint64_t left, uint64_t right) {
         return nodes[static_cast<size_t>(left)].nid < nodes[static_cast<size_t>(right)].nid;
     });
-    std::vector<uint64_t> bbt_keys;
-    bbt_keys.reserve(state.blocks.size());
-    for (size_t slot = 0; slot < state.blocks.size(); ++slot) {
-        const auto& block = state.blocks[slot];
-        bbt_keys.push_back(block.bid);
-    }
     std::vector<uint64_t> nbt_keys;
     nbt_keys.reserve(nodes.size());
     for (uint64_t index : nbt_order) {
@@ -539,12 +543,16 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
     }
 
     Result<std::vector<std::vector<PageSpec>>> bbt =
-        build_levels(ndb::kPageTypeBBT, ndb::kBbtEntrySize, bbt_keys);
+        build_levels(ndb::kPageTypeBBT, ndb::kBbtEntrySize, state.blocks.size(),
+                     [&](uint64_t index) { return state.blocks[static_cast<size_t>(index)].bid; });
+    if (!state.blocks.status().ok())
+        return state.blocks.status().error();
     if (!bbt.ok()) {
         return bbt.error();
     }
     Result<std::vector<std::vector<PageSpec>>> nbt =
-        build_levels(ndb::kPageTypeNBT, ndb::kNbtEntrySize, nbt_keys);
+        build_levels(ndb::kPageTypeNBT, ndb::kNbtEntrySize, nbt_keys.size(),
+                     [&](uint64_t index) { return nbt_keys[static_cast<size_t>(index)]; });
     if (!nbt.ok()) {
         return nbt.error();
     }
@@ -586,6 +594,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
         uint64_t cursor = data_start;
         for (size_t slot = 0; slot < state.blocks.size(); ++slot) {
             auto& block = state.blocks[slot];
+            if (!state.blocks.status().ok())
+                return state.blocks.status().error();
             block.ib = take_range(reserved, cursor, block.footprint());
             cursor = block.ib + block.footprint();
         }
@@ -645,6 +655,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
         mark_units(page.ib, page.cb);
     for (size_t slot = 0; slot < state.blocks.size(); ++slot) {
         const auto& block = state.blocks[slot];
+        if (!state.blocks.status().ok())
+            return state.blocks.status().error();
         mark_units(block.ib, block.footprint());
     }
     for (PageSpec* page : pages) {
@@ -711,9 +723,12 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
             return written.error();
     }
 
-    image.blocks.reserve(state.blocks.size());
+    if (!workspace)
+        image.blocks.reserve(state.blocks.size());
     for (size_t slot = 0; slot < state.blocks.size(); ++slot) {
         const auto& block = state.blocks[slot];
+        if (!state.blocks.status().ok())
+            return state.blocks.status().error();
         std::vector<uint8_t> out(static_cast<size_t>(block.footprint()), 0);
         if (block.internal()) {
             const auto& bytes = state.internal_bytes[static_cast<size_t>(block.source_index)];
@@ -733,7 +748,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
         written = write(block.ib, out);
         if (!written.ok())
             return written.error();
-        image.blocks.push_back(WrittenBlock{block.bid, block.ib, block.cb, block.c_ref});
+        if (!workspace)
+            image.blocks.push_back(WrittenBlock{block.bid, block.ib, block.cb, block.c_ref});
     }
 
     // Every page: rgentries, then the footer, then the pageTrailer. A leaf entry's key is the BID
@@ -750,6 +766,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
                 entries.resize(at + page->cb_ent);
                 if (page->ptype == ndb::kPageTypeBBT) {
                     const BlockRecord& block = state.blocks[static_cast<size_t>(index)];
+                    if (!state.blocks.status().ok())
+                        return state.blocks.status().error();
                     put_u64(entries, at + ndb::kBbtEntryBidOffset, block.bid);
                     put_u64(entries, at + ndb::kBbtEntryIbOffset, block.ib);
                     put_u16(entries, at + ndb::kBbtEntryCbOffset, block.cb);
@@ -837,6 +855,8 @@ Result<StoreImage> write_store_to(const StoreBlockSource& source,
     put_u32(header, ndb::kDwCRCFullOffset,
             util::crc32(ByteView(header.data() + ndb::kCrcFullStart, ndb::kCrcFullLength,
                                  ndb::kCrcFullStart)));
+    if (!state.blocks.status().ok())
+        return state.blocks.status().error();
     written = write(0, header);
     if (!written.ok())
         return written.error();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "ost2pst/writer/staging_workspace.h"
@@ -27,6 +28,7 @@ enum class FullPoint {
 // Explicit in-process seams for deterministic crash/I/O tests. No CLI flags or environment hooks.
 struct FullConversionHooks {
     uint64_t index_workspace_budget = kFullIndexWorkspaceBudget;
+    std::optional<uint64_t> cache_limit_bytes;
     writer::InitializationObserver initialization;
     writer::CommitObserver commit;
     std::function<void(FullPoint)> phase;

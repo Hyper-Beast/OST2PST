@@ -605,6 +605,53 @@ void check_large_item_workspace(bool heap_heavy) {
     std::filesystem::remove(path, ignored);
 }
 
+void check_dense_folder_staging() {
+    constexpr uint32_t nid = 0x200024, folder_nid = 0x8082, count = 69621;
+    auto dense = message(0);
+    for (const uint16_t property : {0x0037, 0x0042, 0x0070, 0x0E03, 0x0E04}) {
+        std::vector<uint8_t> value(84, 0);
+        for (size_t byte = 0; byte < value.size(); byte += 2)
+            value[byte] = 'A';
+        dense.properties.push_back({property, 0x001F, std::move(value)});
+    }
+    auto item = writer::build_item_plan(dense, nid, folder_nid, 1);
+    TEST_OK(item, "prototype contents row for dense folder");
+    if (!item.ok())
+        return;
+    class FolderRows final : public writer::TcRowSource {
+      public:
+        writer::TcRow prototype;
+        uint64_t count() const override { return 69621; }
+        Result<writer::TcRow> read(uint64_t index) const override {
+            auto row = prototype;
+            row.row_id =
+                static_cast<uint32_t>(ltp::make_nid(65537 + index, ltp::kNidTypeNormalMessage));
+            // The generated contents template ends with PidTagLtpRowId / RowVer.
+            row.values[row.values.size() - 2] = u32(row.row_id);
+            return row;
+        }
+    } rows;
+    rows.prototype = item.take().row;
+    writer::FolderPlanRequest request;
+    request.folder = {folder_nid, writer::kNidIpmsubtree, u"Synthetic dense folder", count, count,
+                      false};
+    request.normal_rows = &rows;
+    auto plan = writer::build_folder_plan(request, 1);
+    TEST_OK(plan, "folder construction passes the former table workspace ceiling");
+    if (!plan.ok())
+        return;
+    Scratch data, log;
+    auto opened = writer::StagingJournal::create(data, log, {});
+    TEST_OK(opened, "journal for dense folder fragment");
+    if (!opened.ok())
+        return;
+    auto journal = opened.take();
+    TEST_OK(
+        writer::stage_plan(journal, {}, writer::StagedOutcome::kConverted, plan.value().plan, {}),
+        "dense folder stages within record metadata limit");
+    TEST_EQ(journal.records().size(), 1u, "one complete dense folder fragment committed");
+}
+
 void check_plans() {
     constexpr uint32_t folder_nid = 0x8082;
     constexpr uint32_t child_nid = 0x80A2;
@@ -874,6 +921,7 @@ int main() {
     check_plans();
     check_large_item_workspace(false);
     check_large_item_workspace(true);
+    check_dense_folder_staging();
     auto scaffold = writer::build_scaffold_plan({}, {}, 1027, 65536, 32768);
     TEST_OK(scaffold, "empty standalone scaffold");
     auto empty = writer::build_empty_pst();

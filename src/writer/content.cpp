@@ -547,11 +547,17 @@ Result<std::vector<std::vector<uint8_t>>> chunk_bytes(const std::vector<uint8_t>
 // The blocks of the file. The 23 slots of the minimum mailbox keep their indices so the accepted M4
 // bytes do not move; content blocks are appended after them.
 struct Builder {
-    Builder() : blocks(kSlotCount) {}
+    explicit Builder(std::shared_ptr<util::Workspace> workspace = {})
+        : blocks(kSlotCount), workspace(std::move(workspace)) {
+        if (this->workspace)
+            scratch = std::make_shared<util::SpillBuffer>(this->workspace);
+    }
 
     std::vector<StoreBlock> blocks;
     std::vector<StoreNode> nodes;
     ContentReport report;
+    std::shared_ptr<util::Workspace> workspace;
+    std::shared_ptr<util::SpillBuffer> scratch;
     // HEADER.rgnid counters, seeded exactly as the minimum mailbox left them ([MS-PST] 2.2.2.1).
     uint32_t folder_index = 1027;
     uint32_t message_index = 65536;
@@ -561,10 +567,17 @@ struct Builder {
     uint32_t recipient_row_id = 0;
 
     void set_slot(uint64_t slot, std::vector<uint8_t> bytes) {
-        blocks[static_cast<size_t>(slot)] = StoreBlock{std::move(bytes)};
+        blocks[static_cast<size_t>(slot)] = stored_block(std::move(bytes));
+    }
+    StoreBlock stored_block(std::vector<uint8_t> bytes) {
+        if (!scratch)
+            return StoreBlock{std::move(bytes)};
+        const auto offset = scratch->size();
+        scratch->append(util::ByteView(bytes.data(), bytes.size()));
+        return StoreBlock{{}, scratch, offset, static_cast<uint16_t>(bytes.size())};
     }
     uint64_t append_block(std::vector<uint8_t> bytes) {
-        blocks.push_back(StoreBlock{std::move(bytes)});
+        blocks.push_back(stored_block(std::move(bytes)));
         return blocks.size() - 1;
     }
     Result<std::vector<uint64_t>> append_source(const util::SharedBytes& source) {
@@ -815,27 +828,51 @@ void set_cell(TcRow& row, const std::vector<uint32_t>& tags, uint32_t tag,
 // uses it so the minimum mailbox keeps the BIDs the accepted M4 candidate gave it and no slot ends
 // up naming a block with no bytes ([MS-PST] 2.2.2.7.7.3 gives that block a cb a reader trusts).
 Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>>
-place_node_data(const std::vector<std::vector<uint8_t>>& heap_blocks,
-                const std::vector<LocalSubnode>& local_subnodes, uint32_t matrix_nid,
-                uint64_t matrix_row_size, Builder& builder, int64_t first_slot = -1) {
+place_node_data(const HeapImage& heap, const std::vector<LocalSubnode>& local_subnodes,
+                uint32_t matrix_nid, uint64_t matrix_row_size, Builder& builder,
+                int64_t first_slot = -1) {
     std::vector<uint64_t> data_blocks;
-    data_blocks.reserve(heap_blocks.size());
-    size_t first = 0;
-    if (first_slot >= 0 && !heap_blocks.empty()) {
-        builder.set_slot(static_cast<uint64_t>(first_slot), heap_blocks[0]);
-        data_blocks.push_back(static_cast<uint64_t>(first_slot));
-        first = 1;
-    }
-    for (size_t index = first; index < heap_blocks.size(); ++index) {
-        data_blocks.push_back(builder.append_block(heap_blocks[index]));
-    }
+    data_blocks.reserve(static_cast<size_t>(heap.block_count()));
+    auto streamed = heap.stream_blocks([&](util::ByteView bytes) -> util::Status {
+        std::vector<uint8_t> block(bytes.data(), bytes.data() + bytes.size());
+        if (first_slot >= 0 && data_blocks.empty()) {
+            builder.set_slot(static_cast<uint64_t>(first_slot), std::move(block));
+            data_blocks.push_back(static_cast<uint64_t>(first_slot));
+        } else
+            data_blocks.push_back(builder.append_block(std::move(block)));
+        return builder.scratch ? builder.scratch->status() : util::Status{};
+    });
+    if (!streamed.ok())
+        return streamed.error();
     std::vector<StoreSubnode> subnodes;
     for (const LocalSubnode& local : local_subnodes) {
         const uint64_t row_size = local.nid == matrix_nid ? matrix_row_size : 0;
         if (local.source) {
-            if (!local.bytes.empty() || row_size != 0)
+            if (!local.bytes.empty())
                 return make_error(ErrorKind::kBadField, "writer.local_source", local.nid, row_size,
-                                  "streamed value is not a row matrix");
+                                  "subnode has both resident and streamed values");
+            if (row_size != 0) {
+                if (row_size > kMaxBlockRawBytes || local.source->size() % row_size != 0)
+                    return make_error(ErrorKind::kBadField, "writer.content.row_geometry",
+                                      local.nid, row_size);
+                StoreSubnode subnode;
+                subnode.nid = local.nid;
+                const uint64_t window = (kMaxBlockRawBytes / row_size) * row_size;
+                for (uint64_t offset = 0; offset < local.source->size(); offset += window) {
+                    const auto take =
+                        static_cast<size_t>(std::min(window, local.source->size() - offset));
+                    std::vector<uint8_t> bytes(
+                        offset + take < local.source->size() ? kMaxBlockRawBytes : take, 0);
+                    auto read = local.source->read_at(offset, bytes.data(), take);
+                    if (!read.ok())
+                        return read.error();
+                    subnode.data_blocks.push_back(builder.append_block(std::move(bytes)));
+                    if (builder.scratch && !builder.scratch->status().ok())
+                        return builder.scratch->status().error();
+                }
+                subnodes.push_back(std::move(subnode));
+                continue;
+            }
             auto slots = builder.append_source(local.source);
             if (!slots.ok())
                 return slots.error();
@@ -875,8 +912,9 @@ Result<TableBuild> build_content_table(uint32_t nid, const std::vector<uint32_t>
                                        const std::string& context,
                                        const TcRowSource* source = nullptr) {
     LocalNids local_nids; // the table node's own subnode supply ([MS-PST] 2.6.1.2.2)
-    Result<TcNode> table = source != nullptr ? build_table_from(columns(tags), *source, local_nids)
-                                             : build_table(columns(tags), rows, local_nids);
+    Result<TcNode> table =
+        source != nullptr ? build_table_from(columns(tags), *source, local_nids, builder.workspace)
+                          : build_table(columns(tags), rows, local_nids, builder.workspace);
     if (!table.ok()) {
         return table.error();
     }
@@ -884,9 +922,8 @@ Result<TableBuild> build_content_table(uint32_t nid, const std::vector<uint32_t>
     // ([MS-PST] 2.3.4.1 / 2.3.4.4, read through ltp::read_tc).
     const uint32_t matrix_nid =
         ltp::hid_type(table.value().hnid_rows) == ltp::kHidTypeHid ? 0 : table.value().hnid_rows;
-    Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>> placed =
-        place_node_data(table.value().heap.blocks(), table.value().subnodes, matrix_nid,
-                        table.value().row_size, builder);
+    Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>> placed = place_node_data(
+        table.value().heap, table.value().subnodes, matrix_nid, table.value().row_size, builder);
     if (!placed.ok()) {
         return placed.error();
     }
@@ -1117,7 +1154,7 @@ Result<MessageBuild> build_message(const ContentMessage& message, uint32_t paren
             return pc.error();
         }
         Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>> placed =
-            place_node_data(pc.value().heap.blocks(), pc.value().subnodes, 0, 0, builder);
+            place_node_data(pc.value().heap, pc.value().subnodes, 0, 0, builder);
         if (!placed.ok()) {
             return placed.error();
         }
@@ -1258,7 +1295,7 @@ Result<MessageBuild> build_message(const ContentMessage& message, uint32_t paren
         return pc.error();
     }
     Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>> placed =
-        place_node_data(pc.value().heap.blocks(), pc.value().subnodes, 0, 0, builder);
+        place_node_data(pc.value().heap, pc.value().subnodes, 0, 0, builder);
     if (!placed.ok()) {
         return placed.error();
     }
@@ -1411,7 +1448,7 @@ build_folder(const ContentFolder& folder, uint32_t nid, uint32_t hierarchy_nid,
         return pc.error();
     }
     Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>> placed =
-        place_node_data(pc.value().heap.blocks(), pc.value().subnodes, 0, 0, builder);
+        place_node_data(pc.value().heap, pc.value().subnodes, 0, 0, builder);
     if (!placed.ok()) {
         return placed.error();
     }
@@ -1721,8 +1758,7 @@ build_minimum_mailbox(Builder& builder, const std::vector<NamedProperty>& named,
             return pc.error();
         }
         Result<std::pair<std::vector<uint64_t>, std::vector<StoreSubnode>>> placed =
-            place_node_data(pc.value().heap.blocks(), pc.value().subnodes, 0, 0, builder,
-                            kSlotNameIdMap);
+            place_node_data(pc.value().heap, pc.value().subnodes, 0, 0, builder, kSlotNameIdMap);
         if (!placed.ok()) {
             return placed.error();
         }
@@ -2144,7 +2180,7 @@ class CheckedFolderRows final : public TcRowSource {
 } // namespace
 
 Result<ItemPlan> build_item_plan(const ContentMessage& message, uint32_t nid, uint32_t parent_nid,
-                                 uint64_t named_count) {
+                                 uint64_t named_count, std::shared_ptr<util::Workspace> workspace) {
     const auto type = ltp::nid_type(nid);
     if ((type != ltp::kNidTypeNormalMessage && type != ltp::kNidTypeAssocMessage) ||
         ltp::nid_type(parent_nid) != ltp::kNidTypeNormalFolder ||
@@ -2156,7 +2192,7 @@ Result<ItemPlan> build_item_plan(const ContentMessage& message, uint32_t nid, ui
     auto indices = named_indices(named_count);
     if (!indices.ok())
         return indices.error();
-    Builder builder;
+    Builder builder(workspace);
     builder.blocks.clear();
     auto built = build_message(message, parent_nid, indices.value(), builder, nid);
     if (!built.ok())
@@ -2184,6 +2220,8 @@ Result<ItemPlan> build_item_plan(const ContentMessage& message, uint32_t nid, ui
         }
     }
     builder.nodes.push_back(std::move(built.value().node));
+    if (builder.scratch && !builder.scratch->status().ok())
+        return builder.scratch->status().error();
     result.content = take_content_plan(builder);
     return result;
 }
@@ -2263,7 +2301,7 @@ Result<ContentPlan> build_folder_plan(const FolderPlanRequest& request, uint64_t
         return make_error(ErrorKind::kBadField, "writer.folder.hidden_presence", request.folder.nid,
                           0, "hierarchy summary and folder PC hidden-count presence disagree");
     }
-    Builder builder;
+    Builder builder(request.workspace);
     builder.blocks.clear();
     const uint64_t index = ltp::nid_index(request.folder.nid);
     auto built = build_folder(
@@ -2274,13 +2312,16 @@ Result<ContentPlan> build_folder_plan(const FolderPlanRequest& request, uint64_t
         indices.value(), builder, &normal, &associated, request.folder.unread_count, false);
     if (!built.ok())
         return built.error();
+    if (builder.scratch && !builder.scratch->status().ok())
+        return builder.scratch->status().error();
     return take_content_plan(builder);
 }
 
 Result<ContentPlan> build_scaffold_plan(const std::vector<NamedProperty>& named,
                                         const std::vector<FolderSummary>& root_children,
                                         uint32_t last_folder_index, uint32_t last_message_index,
-                                        uint32_t last_associated_index) {
+                                        uint32_t last_associated_index,
+                                        std::shared_ptr<util::Workspace> workspace) {
     auto indices = named_indices(named.size());
     if (!indices.ok())
         return indices.error();
@@ -2291,7 +2332,7 @@ Result<ContentPlan> build_scaffold_plan(const std::vector<NamedProperty>& named,
                           last_message_index,
                           "reserved allocation counters are outside their NID range");
     }
-    Builder builder;
+    Builder builder(workspace);
     builder.folder_index = last_folder_index;
     builder.message_index = last_message_index;
     builder.report.named_properties = named.size();

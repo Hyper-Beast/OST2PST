@@ -167,6 +167,7 @@ struct FolderSummary {
 };
 
 struct FolderPlanRequest {
+    std::shared_ptr<util::Workspace> workspace;
     FolderSummary folder;
     std::vector<ContentProperty> properties;
     std::vector<FolderSummary> children;
@@ -177,13 +178,15 @@ struct FolderPlanRequest {
 // Output NIDs are reserved by the conversion manifest before extraction. Named indices
 // use the same fixed registry for all plans; the scaffold carries the registry itself.
 util::Result<ItemPlan> build_item_plan(const ContentMessage& message, uint32_t nid,
-                                       uint32_t parent_nid, uint64_t named_count);
+                                       uint32_t parent_nid, uint64_t named_count,
+                                       std::shared_ptr<util::Workspace> workspace = {});
 util::Result<ContentPlan> build_folder_plan(const FolderPlanRequest& request, uint64_t named_count);
 util::Result<ContentPlan> build_scaffold_plan(const std::vector<NamedProperty>& named,
                                               const std::vector<FolderSummary>& root_children,
                                               uint32_t last_folder_index,
                                               uint32_t last_message_index,
-                                              uint32_t last_associated_index);
+                                              uint32_t last_associated_index,
+                                              std::shared_ptr<util::Workspace> workspace = {});
 
 // Builds the whole store: the minimum mailbox exactly as build_empty_pst emitted it, plus the
 // content of the request. With an empty request the image is byte-for-byte the M4 candidate.

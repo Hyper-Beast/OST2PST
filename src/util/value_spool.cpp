@@ -5,7 +5,15 @@
 #include <limits>
 #include <random>
 
+#include "ost2pst/util/workspace.h"
+
 namespace ost2pst::util {
+ValueSpool::ValueSpool(std::shared_ptr<Workspace> workspace)
+    : resident_budget_(0), value_limit_(0),
+      shared_spool_(std::make_shared<SpillBuffer>(std::move(workspace))) {}
+Status ValueSpool::spill_shared_cache() {
+    return shared_spool_ ? shared_spool_->spill_to_disk() : Status{};
+}
 namespace {
 class FileRange final : public ByteSource {
   public:
@@ -51,6 +59,32 @@ Result<StoredValue> ValueSpool::capture(const ByteProducer& producer) {
         return *io_error_;
     if (!producer)
         return make_error(ErrorKind::kBadField, "spool.producer", 0, 0);
+    if (shared_spool_) {
+        const uint64_t start = shared_spool_->size();
+        Status consumer_status;
+        auto produced = producer([&](ByteView bytes) -> Status {
+            if (!consumer_status.ok())
+                return consumer_status;
+            if (bytes.size() > UINT32_MAX - (shared_spool_->size() - start))
+                consumer_status =
+                    make_error(ErrorKind::kUnsupported, "spool.value_size", start, bytes.size());
+            else
+                consumer_status = shared_spool_->append(bytes);
+            return consumer_status;
+        });
+        if (!consumer_status.ok())
+            produced = consumer_status;
+        if (!produced.ok()) {
+            if (produced.error().kind == ErrorKind::kIo)
+                io_error_ = produced.error();
+            return produced.error();
+        }
+        StoredValue result;
+        if (shared_spool_->size() != start)
+            result.source =
+                std::make_shared<SourceRange>(shared_spool_, start, shared_spool_->size() - start);
+        return result;
+    }
     StoredValue result;
     const uint64_t limit = std::min(value_limit_, resident_budget_ - resident_bytes_);
     uint64_t offset = 0, total = 0;

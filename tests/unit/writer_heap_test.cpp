@@ -1,8 +1,10 @@
-// Every PC and TC the writer emits is a heap node, so this file checks the builder against the one HN
-// the spec spells out byte for byte ([MS-PST] 3.8, tests/fixtures/spec-example-hn.bin) and then reads
-// the built image back through the reader's own HN decode ([MS-PST] 2.3.1.2 / 2.3.1.5 / 2.3.1.1).
+// Every PC and TC the writer emits is a heap node, so this file checks the builder against the one
+// HN the spec spells out byte for byte ([MS-PST] 3.8, tests/fixtures/spec-example-hn.bin) and then
+// reads the built image back through the reader's own HN decode ([MS-PST] 2.3.1.2 / 2.3.1.5
+// / 2.3.1.1).
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <vector>
 
 #include "ost2pst/ltp/block_heap.h"
@@ -14,6 +16,7 @@
 #include "ost2pst/util/status.h"
 #include "ost2pst/writer/heap.h"
 #include "ost2pst/writer/layout.h"
+
 #include "test_support.h"
 
 namespace {
@@ -35,7 +38,7 @@ using ost2pst::writer::HeapImage;
 constexpr FileProfile kProfile = FileProfile::kPst;
 constexpr uint64_t kBlockBase = 0x4800;
 
-ByteView view_of(const std::vector<uint8_t> &bytes) {
+ByteView view_of(const std::vector<uint8_t>& bytes) {
     return ByteView(bytes.data(), bytes.size(), kBlockBase);
 }
 
@@ -64,7 +67,8 @@ void check_spec_sample() {
     }
     TEST_EQ(map.value().c_alloc, 8, "spec sample cAlloc");
     TEST_EQ(map.value().c_free, 0, "spec sample cFree");
-    const uint16_t expected[] = {0x000C, 0x0014, 0x006C, 0x007C, 0x008C, 0x00A4, 0x00BC, 0x00D4, 0x00EC};
+    const uint16_t expected[] = {0x000C, 0x0014, 0x006C, 0x007C, 0x008C,
+                                 0x00A4, 0x00BC, 0x00D4, 0x00EC};
     for (int index = 0; index < 9; ++index) {
         TEST_EQ(map.value().offsets[static_cast<size_t>(index)], expected[index],
                 "spec sample rgibAlloc");
@@ -73,9 +77,8 @@ void check_spec_sample() {
     // Rebuilt from its own allocations, the writer has to produce the same 258 bytes.
     HeapImage rebuilt(header.value().b_client_sig);
     for (uint16_t index = 1; index <= map.value().c_alloc; ++index) {
-        Result<ByteView> item = hn_heap_item(map.value(), view_of(sample),
-                                             static_cast<uint32_t>(index << 5),
-                                             kProfile);
+        Result<ByteView> item =
+            hn_heap_item(map.value(), view_of(sample), static_cast<uint32_t>(index << 5), kProfile);
         TEST_OK(item, "spec sample allocation");
         if (!item.ok()) {
             return;
@@ -134,13 +137,15 @@ void check_reader_round_trip() {
     TEST_EQ(map.value().c_free, 0, "built cFree");
     const uint16_t expected[] = {0x000C, 0x0014, 0x006C, 0x007C};
     for (int index = 0; index < 4; ++index) {
-        TEST_EQ(map.value().offsets[static_cast<size_t>(index)], expected[index], "built rgibAlloc");
+        TEST_EQ(map.value().offsets[static_cast<size_t>(index)], expected[index],
+                "built rgibAlloc");
     }
 
-    const std::vector<uint8_t> *want[] = {&first, &second, &third};
+    const std::vector<uint8_t>* want[] = {&first, &second, &third};
     const uint32_t hids[] = {0x20, 0x40, 0x60};
     for (int index = 0; index < 3; ++index) {
-        Result<ByteView> item = hn_heap_item(map.value(), view_of(heap.bytes()), hids[index], kProfile);
+        Result<ByteView> item =
+            hn_heap_item(map.value(), view_of(heap.bytes()), hids[index], kProfile);
         TEST_OK(item, "heap item");
         if (!item.ok()) {
             continue;
@@ -153,11 +158,11 @@ void check_reader_round_trip() {
     }
 
     // A HID past the last allocation is a data error, not a read past the map ([MS-PST] 2.3.1.1).
-    TEST_ERROR(hn_heap_item(map.value(), view_of(heap.bytes()), 0x80, kProfile), ErrorKind::kBadField,
-               "HNPAGEMAP.cAlloc", "HID 0x80 names allocation 4");
+    TEST_ERROR(hn_heap_item(map.value(), view_of(heap.bytes()), 0x80, kProfile),
+               ErrorKind::kBadField, "HNPAGEMAP.cAlloc", "HID 0x80 names allocation 4");
     // A HID whose type bits are not NID_TYPE_HID is a node id, not a heap id.
-    TEST_ERROR(hn_heap_item(map.value(), view_of(heap.bytes()), 0x21, kProfile), ErrorKind::kBadField,
-               "HID", "a NID is not a heap id");
+    TEST_ERROR(hn_heap_item(map.value(), view_of(heap.bytes()), 0x21, kProfile),
+               ErrorKind::kBadField, "HID", "a NID is not a heap id");
 }
 
 void check_writer_rejections() {
@@ -172,7 +177,8 @@ void check_writer_rejections() {
                "writer.heap.allocation_capacity", "a block past the packing target");
     TEST_EQ(too_big.allocation_count(), 0, "a rejected append leaves the heap unchanged");
 
-    // cb is HNHDR + allocation + HNPAGEMAP, so the largest single allocation is 4608 - 12 - 8 bytes.
+    // cb is HNHDR + allocation + HNPAGEMAP, so the largest single allocation is 4608 - 12 - 8
+    // bytes.
     HeapImage fits(0xBC);
     TEST_OK(fits.append(std::vector<uint8_t>(4588, 0x11)), "a block at the packing target");
     TEST_EQ(fits.ib_hnpm(), 4600, "map position at the packing target");
@@ -200,16 +206,16 @@ void check_odd_payload_keeps_length_and_aligns_map() {
     TEST_EQ(heap.ib_hnpm(), 16u, "two payloads with an even total need no gap");
 }
 
-// A Message PC or a Contents Table heap is bigger than one data block: the sample's Message PC 0x002001C4
-// holds 114 allocations in 12,774 heap bytes and its ACSL Contents Table holds 750 in 103,192
-// (DEVELOPMENT.md,
-// research/subtree-852E-acsl-contents.txt). Nine 4500-byte allocations is the shortest node that also
-// reaches the HNBITMAPHDR at block 8 ([MS-PST] 2.3.1.4).
+// A Message PC or a Contents Table heap is bigger than one data block: the sample's Message PC
+// 0x002001C4 holds 114 allocations in 12,774 heap bytes and its ACSL Contents Table holds 750 in
+// 103,192 (DEVELOPMENT.md, research/subtree-852E-acsl-contents.txt). Nine 4500-byte allocations is
+// the shortest node that also reaches the HNBITMAPHDR at block 8 ([MS-PST] 2.3.1.4).
 void check_multi_block_heap() {
     HeapImage heap(0xBC);
     std::vector<uint32_t> hids;
     for (int index = 0; index < 9; ++index) {
-        Result<uint32_t> hid = heap.append(std::vector<uint8_t>(4500, static_cast<uint8_t>(0xA0 + index)));
+        Result<uint32_t> hid =
+            heap.append(std::vector<uint8_t>(4500, static_cast<uint8_t>(0xA0 + index)));
         TEST_OK(hid, "an allocation that opens the next block");
         if (!hid.ok()) {
             return;
@@ -219,17 +225,19 @@ void check_multi_block_heap() {
     TEST_EQ(heap.allocation_count(), 9u, "allocation count");
     TEST_EQ(heap.block_count(), 9u, "nine 4500-byte allocations need nine data blocks");
 
-    // [MS-PST] 2.3.1.1: a HID names the data block its item lives in. Block 0 keeps the numbering the
-    // single-block case had, so nothing about a small heap node changed.
+    // [MS-PST] 2.3.1.1: a HID names the data block its item lives in. Block 0 keeps the numbering
+    // the single-block case had, so nothing about a small heap node changed.
     TEST_EQ(hids[0], 0x20u, "the first allocation is still HID 0x20");
     TEST_EQ(hids[1], 0x00010020u, "the second block's first allocation");
     TEST_EQ(hids[8], 0x00080020u, "the ninth block's first allocation");
     for (size_t index = 0; index < hids.size(); ++index) {
-        TEST_EQ(ost2pst::ltp::hid_block_index(hids[index], kProfile), index, "hidBlockIndex names the block");
-        TEST_EQ(ost2pst::ltp::hid_index(hids[index], kProfile), 1u, "one allocation per block, numbered 1");
+        TEST_EQ(ost2pst::ltp::hid_block_index(hids[index], kProfile), index,
+                "hidBlockIndex names the block");
+        TEST_EQ(ost2pst::ltp::hid_index(hids[index], kProfile), 1u,
+                "one allocation per block, numbered 1");
     }
 
-    const std::vector<std::vector<uint8_t>> &blocks = heap.blocks();
+    const std::vector<std::vector<uint8_t>>& blocks = heap.blocks();
     TEST_EQ(blocks.size(), 9u, "one image per data block");
     std::vector<ost2pst::ltp::HnFragment> fragments;
     for (size_t index = 0; index < blocks.size(); ++index) {
@@ -249,7 +257,8 @@ void check_multi_block_heap() {
             continue;
         }
         TEST_EQ(map.value().c_alloc, 1u, "one allocation in this block");
-        TEST_EQ(map.value().offsets[0], header, "the allocation starts after the header this block carries");
+        TEST_EQ(map.value().offsets[0], header,
+                "the allocation starts after the header this block carries");
         Result<ByteView> item = hn_heap_item(map.value(), view, hids[index], kProfile);
         TEST_OK(item, "the item the HID names");
         if (item.ok()) {
@@ -268,8 +277,9 @@ void check_multi_block_heap() {
         fragments.push_back(std::move(fragment));
     }
 
-    // [MS-PST] 2.3.1.2 / 2.3.1.3 / 2.3.1.4: only block 0 carries bSig, bClientSig and hidUserRoot; block 8
-    // and every 128th block after it carries a Fill Level Map; the blocks in between carry ibHnpm alone.
+    // [MS-PST] 2.3.1.2 / 2.3.1.3 / 2.3.1.4: only block 0 carries bSig, bClientSig and hidUserRoot;
+    // block 8 and every 128th block after it carries a Fill Level Map; the blocks in between carry
+    // ibHnpm alone.
     TEST_EQ(blocks[0][ost2pst::ltp::kHnSigOffset], ost2pst::ltp::kHnSignature, "block 0 bSig");
     TEST_EQ(blocks[0][ost2pst::ltp::kHnClientSigOffset], 0xBC, "block 0 bClientSig");
     TEST_EQ(heap.hid_user_root(), 0x20u, "hidUserRoot is still the first allocation");
@@ -283,14 +293,16 @@ void check_multi_block_heap() {
         }
     }
 
-    // The reader reaches a multi-block node's items through its data tree fragments, which is exactly the
-    // source open_node builds for a node whose bidData is an XBLOCK ([MS-PST] 2.2.2.8.3.2.1 / 2.3.1.6.2).
+    // The reader reaches a multi-block node's items through its data tree fragments, which is
+    // exactly the source open_node builds for a node whose bidData is an XBLOCK
+    // ([MS-PST] 2.2.2.8.3.2.1 / 2.3.1.6.2).
     ost2pst::ltp::NodeFragmentHeapSource source(fragments, kProfile);
     for (size_t index = 0; index < hids.size(); ++index) {
         Result<ByteView> item = source.heap(hids[index]);
         TEST_OK(item, "the reader reads every block of the node");
         if (item.ok()) {
-            TEST_EQ(item.value().data()[0], static_cast<uint8_t>(0xA0 + index), "item from the right block");
+            TEST_EQ(item.value().data()[0], static_cast<uint8_t>(0xA0 + index),
+                    "item from the right block");
         }
     }
     TEST_EQ(source.cross_block_misses, 0u, "no HID named a block the node does not have");
@@ -372,6 +384,47 @@ void check_patch_names_an_allocation_that_comes_later() {
     TEST_EQ(heap.blocks()[0].size(), before, "and does not resize the block");
 }
 
+void check_spill_copy_and_hid_capacity() {
+    auto resources = std::make_shared<ost2pst::util::Workspace>(
+        std::filesystem::temp_directory_path().wstring(), 128 * 1024);
+    {
+        HeapImage original(0xBC);
+        original.enable_spill(resources);
+        TEST_OK(original.append({1, 2, 3, 4}), "spooled heap allocation");
+        HeapImage copy = original;
+        TEST_OK(copy.patch(1, 0, 0x88776655u), "copy-on-write spooled heap patch");
+        TEST_OK(copy.append({9, 10}), "append to copied spooled heap");
+        TEST_EQ(original.allocation_count(), 1u, "original allocation count unchanged");
+        TEST_EQ(copy.allocation_count(), 2u, "copy owns appended item");
+        size_t blocks = 0;
+        TEST_OK(original.stream_blocks([&](ByteView image) -> ost2pst::util::Status {
+            TEST_EQ(image.u32(12).value(), 0x04030201u, "original bytes unchanged");
+            ++blocks;
+            return {};
+        }),
+                "stream original after modifying its copy");
+        TEST_EQ(blocks, 1u, "one original block");
+    }
+    {
+        HeapImage heap(0xBC);
+        heap.enable_spill(resources);
+        // 3580-byte allocations cannot share a block under the existing packing
+        // policy. Reach the actual HID boundary without retaining their payloads.
+        for (uint64_t block = 0; block < ost2pst::ltp::kDataTreeMaxBlocks512; ++block) {
+            auto appended = heap.append(std::vector<uint8_t>(3580, 0x53));
+            TEST_OK(appended, "HID addressable block");
+            if (!appended.ok())
+                return;
+            TEST_EQ(ost2pst::ltp::hid_block_index(appended.value(), kProfile), block,
+                    "HID block index never wraps");
+        }
+        TEST_ERROR(heap.append(std::vector<uint8_t>(3580, 0x54)), ErrorKind::kUnsupported,
+                   "writer.heap.block_index", "format bound still enforced with disk scratch");
+        TEST_EQ(heap.block_count(), ost2pst::ltp::kDataTreeMaxBlocks512, "refusal adds no block");
+        TEST_CHECK(resources->memory->peak() <= resources->memory->limit());
+    }
+    TEST_EQ(resources->memory->used(), 0u, "heap scratch released");
+}
 } // namespace
 
 int main() {
@@ -383,7 +436,6 @@ int main() {
     check_allocation_too_big_for_any_block();
     check_fill_level_uses_data_capacity();
     check_patch_names_an_allocation_that_comes_later();
+    check_spill_copy_and_hid_capacity();
     return ost2pst::test::finish("writer_heap_test");
 }
-
-

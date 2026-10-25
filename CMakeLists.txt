@@ -20,6 +20,7 @@ endif()
 
 # util: byte/CRC/IO primitives. Knows nothing about PST concepts.
 add_library(ost2pst_util STATIC
+  src/util/workspace.cpp
   src/util/value_spool.cpp
   src/util/crc32.cpp
   src/util/inflate.cpp
