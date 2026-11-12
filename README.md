@@ -1,3 +1,11 @@
+## ☕ Support
+
+If **OST2PST** rescued your emails or saved you from buying expensive commercial recovery tools, consider buying me a coffee!
+
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Me-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/hyperbeast)
+[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/KirinH93)
+
+
 # OST2PST
 
 [English](#english) · [简体中文](#简体中文)
