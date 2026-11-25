@@ -24,7 +24,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN &&
                     (message.hwnd == GetDlgItem(wizard.window(), ost2pst::gui::kPath) ||
                      message.hwnd == wizard.window())) {
-                    SendMessageW(wizard.window(), WM_COMMAND, ost2pst::gui::kPrimary, 0);
+                    const auto action = LOWORD(SendMessageW(wizard.window(), DM_GETDEFID, 0, 0));
+                    SendMessageW(wizard.window(), WM_COMMAND, action, 0);
                     continue;
                 }
                 if (!IsDialogMessageW(wizard.window(), &message)) {

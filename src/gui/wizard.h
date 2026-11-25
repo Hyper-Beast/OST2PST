@@ -16,7 +16,9 @@ enum ControlId {
     kReport,
     kFolder,
     kResume,
-    kLanguage
+    kLanguage,
+    kGithub,
+    kCoffee
 };
 class Wizard {
   public:
@@ -34,10 +36,13 @@ class Wizard {
          close_ = nullptr, details_ = nullptr, report_ = nullptr, folder_ = nullptr,
          resume_ = nullptr, heading_ = nullptr, label_ = nullptr, note_ = nullptr, phase_ = nullptr,
          progress_ = nullptr, processed_ = nullptr, elapsed_ = nullptr, location_ = nullptr,
-         language_ = nullptr, language_label_ = nullptr;
+         language_ = nullptr, language_label_ = nullptr, github_ = nullptr, coffee_ = nullptr,
+         intro_ = nullptr;
     HWND stat_labels_[3]{}, stat_values_[3]{};
-    HFONT body_font_ = nullptr, title_font_ = nullptr, small_font_ = nullptr, value_font_ = nullptr;
+    HFONT body_font_ = nullptr, title_font_ = nullptr, small_font_ = nullptr, value_font_ = nullptr,
+          emphasis_font_ = nullptr;
     HBRUSH white_ = nullptr, background_ = nullptr;
+    ULONG_PTR gdiplus_token_ = 0;
     UINT dpi_ = 96, test_dpi_ = 0;
     bool test_high_contrast_ = false;
     int step_ = 0;
@@ -47,6 +52,7 @@ class Wizard {
     bool progress_marquee_ = false;
     int progress_position_ = -1;
     std::wstring source_, output_;
+    std::wstring picked_path_, picked_size_;
     Snapshot snapshot_;
     Text note_key_ = Text::kSize;
     std::chrono::steady_clock::time_point started_;
@@ -62,6 +68,8 @@ class Wizard {
     void change_language();
     void paint();
     void draw_button(const DRAWITEMSTRUCT& item);
+    void draw_source_picker(const DRAWITEMSTRUCT& item);
+    void select_source(const std::wstring& path);
     void command(int id);
     void browse();
     void start(bool resume);
@@ -70,6 +78,6 @@ class Wizard {
     bool validate_source();
     bool validate_destination(bool& resume);
     void set_note(Text text);
-    void open_path(const std::wstring& path);
+    void open_path(const std::wstring& path, Text on_error = Text::open_error);
 };
 } // namespace ost2pst::gui

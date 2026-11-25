@@ -102,6 +102,7 @@ all MSVC targets for the portable package. Generated resources are checked in; a
 builds need neither Python nor a GUI framework. `scripts/package_gui.py` refuses existing outputs
 and packages `OST2PST.exe`, `engine/ost2pst.exe`, notices, usage and SHA-256 manifest. Keep the
 two executables together. Updating the worker changes recovery's binary identity.
+For the separately packaged Store desktop app, see [the MSIX release guide](store/README.md).
 
 `src/gui/protocol.*` owns dependency-free JSON parsing, locale matching, quoting and the typed
 session reducer. `process_host.*` owns subprocesses/pipes and `wizard.*` renders snapshots.
@@ -144,10 +145,13 @@ the current page and validation without resetting entered paths, the active run,
 Selection is process-local. Edit `resources/gui/catalogs.json`, run `scripts/generate_gui_strings.py`,
 then `--check`. Preserve key/placeholder parity. Do not hand-edit generated `strings.h`.
 
-The four native pages use Segoe UI, standard file dialogs, keyboard traversal, a per-monitor DPI
+The four native pages use system UI fonts for the selected language, standard file dialogs, keyboard traversal, a per-monitor DPI
 manifest, scaled fonts/reflow and Windows high-contrast colors. Result actions share one footer
 baseline. Existing outputs/reports are protected and reserved destination filenames are rejected.
 Keep implementation diagnostics behind Details; the main conversion flow uses formal short labels.
+The source picker accepts one dropped file and retains an editable path. The header GitHub link is
+available on every page. The optional Ko-fi link appears only on a reconciled complete result,
+never on partial, failed or stopped runs. Links open fixed HTTPS destinations only on activation.
 
 Run `ctest -R gui_ --output-on-failure` after GUI changes. Protocol tests cover adversarial parsing,
 result reconciliation and real worker complete/incomplete/failure/resume paths. Native tests use

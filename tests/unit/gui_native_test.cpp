@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <objbase.h>
+#include <shlobj.h>
 // clang-format on
 #include <atomic>
 #include <cstdio>
@@ -92,6 +93,19 @@ void click(HWND w, int id) {
                  reinterpret_cast<LPARAM>(GetDlgItem(w, id)));
     pump();
 }
+void drop_file(HWND w, const std::wstring& path) {
+    const size_t bytes = (path.size() + 1) * sizeof(wchar_t);
+    auto block = GlobalAlloc(GHND, sizeof(DROPFILES) + bytes + sizeof(wchar_t));
+    check(block != nullptr, "allocate dropped file list");
+    auto* drop = static_cast<DROPFILES*>(GlobalLock(block));
+    check(drop != nullptr, "lock dropped file list");
+    drop->pFiles = sizeof(DROPFILES);
+    drop->fWide = TRUE;
+    memcpy(drop + 1, path.c_str(), bytes);
+    GlobalUnlock(block);
+    SendMessageW(w, WM_DROPFILES, reinterpret_cast<WPARAM>(block), 0);
+    pump();
+}
 void switch_language(HWND w, int index) {
     HWND combo = GetDlgItem(w, kLanguage);
     SendMessageW(combo, CB_SETCURSEL, index, 0);
@@ -114,6 +128,24 @@ void footer_aligned(HWND w) {
         RECT r;
         GetWindowRect(button, &r);
         check(r.top == reference.top && r.bottom == reference.bottom, "result footer one baseline");
+    }
+}
+void check_links(HWND w, bool complete) {
+    auto url = [](HWND link) -> std::wstring {
+        LITEM item{};
+        item.mask = LIF_ITEMINDEX | LIF_URL;
+        check(SendMessageW(link, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&item)) != 0,
+              "native hyperlink target is readable");
+        return item.szUrl;
+    };
+    HWND github = GetDlgItem(w, kGithub), coffee = GetDlgItem(w, kCoffee);
+    check(IsWindowVisible(github) && url(github) == L"https://github.com/Hyper-Beast/OST2PST",
+          "project repository stays available");
+    check(coffee && (IsWindowVisible(coffee) != FALSE) == complete, "only success offers coffee");
+    if (complete) {
+        check(url(coffee) == L"https://ko-fi.com/hyperbeast", "coffee target on complete result");
+        check(GetFocus() != coffee && LOWORD(SendMessageW(w, DM_GETDEFID, 0, 0)) == kPrimary,
+              "coffee never becomes the default action");
     }
 }
 struct ProgressMessages {
@@ -254,7 +286,13 @@ int wmain(int argc, wchar_t** argv) {
             check(SendMessageW(GetDlgItem(w, kLanguage), CB_GETCOUNT, 0, 0) == 9,
                   "nine language choices");
             modal_action(w, 0, [&] { click(w, kBrowse); });
-            SetWindowTextW(GetDlgItem(w, kPath), long_source.c_str());
+            check(!IsWindowEnabled(GetDlgItem(w, kPrimary)),
+                  "cancelled picker keeps Next inactive");
+            check_links(w, false);
+            drop_file(w, long_source.wstring());
+            check(IsWindowEnabled(GetDlgItem(w, kPrimary)) &&
+                      LOWORD(SendMessageW(w, DM_GETDEFID, 0, 0)) == kPrimary,
+                  "a dropped file activates Next without starting");
             for (int lang = 0; lang < 9; ++lang) {
                 switch_language(w, lang);
                 check(caption(GetDlgItem(w, kPath)) == long_source.wstring(),
@@ -262,6 +300,7 @@ int wmain(int argc, wchar_t** argv) {
             }
             click(w, kPrimary);
             const auto destination = root / L"ui-stop.pst";
+            check_links(w, false);
             SetWindowTextW(GetDlgItem(w, kPath), (root / L"CON.pst").c_str());
             click(w, kPrimary);
             check(IsWindowVisible(GetDlgItem(w, kBack)) != FALSE,
@@ -278,6 +317,7 @@ int wmain(int argc, wchar_t** argv) {
             }
             click(w, kPrimary);
             ProgressMessages progress_seen;
+            check_links(w, false);
             HWND progress = progress_control(w);
             SetWindowSubclass(progress, progress_messages, 1,
                               reinterpret_cast<DWORD_PTR>(&progress_seen));
@@ -294,6 +334,7 @@ int wmain(int argc, wchar_t** argv) {
             check(until([&] { return IsWindowVisible(GetDlgItem(w, kResume)) != FALSE; }),
                   "UI stop exposes resume after drain");
             check(!IsWindowVisible(GetDlgItem(w, kReport)), "stopped output is not successful");
+            check_links(w, false);
             for (int lang = 0; lang < 9; ++lang) {
                 switch_language(w, lang);
                 check(IsWindowVisible(GetDlgItem(w, kResume)), "recovery survives language switch");
@@ -303,6 +344,23 @@ int wmain(int argc, wchar_t** argv) {
             click(w, kResume);
             check(until([&] { return IsWindowVisible(GetDlgItem(w, kReport)) != FALSE; }, 90000),
                   "UI resumes to authoritative success");
+            check_links(w, true);
+            const auto bad = root / L"bad.ost";
+            std::ofstream(bad) << "not an OST";
+            for (const auto& input : {incomplete, bad}) {
+                click(w, kPrimary);
+                check_links(w, false);
+                SetWindowTextW(GetDlgItem(w, kPath), input.c_str());
+                click(w, kPrimary);
+                SetWindowTextW(GetDlgItem(w, kPath),
+                               (root / (L"ui-" + input.stem().wstring() + L".pst")).c_str());
+                click(w, kPrimary);
+                check(until([&] { return IsWindowVisible(GetDlgItem(w, kDetails)) != FALSE; }),
+                      "incomplete or failed UI result");
+                check((IsWindowVisible(GetDlgItem(w, kReport)) != FALSE) == (input == incomplete),
+                      "partial report distinct from failure");
+                check_links(w, false);
+            }
             click(w, kPrimary);
             SetWindowTextW(GetDlgItem(w, kPath), long_source.c_str());
             click(w, kPrimary);
@@ -325,9 +383,11 @@ int wmain(int argc, wchar_t** argv) {
                 const auto stem = std::filesystem::path(lang).string() + "-" + std::to_string(dpi);
                 check(ui.layout_valid(), "source layout");
                 screenshot(w, root / (stem + "-source.bmp"));
-                check(GetNextDlgTabItem(w, nullptr, FALSE) == GetDlgItem(w, kPath),
-                      "first focus is path");
+                check(GetNextDlgTabItem(w, nullptr, FALSE) == GetDlgItem(w, kBrowse) &&
+                          LOWORD(SendMessageW(w, DM_GETDEFID, 0, 0)) == kBrowse,
+                      "source picker is first and default on an empty page");
                 SetWindowTextW(GetDlgItem(w, kPath), source.c_str());
+                check(IsWindowEnabled(GetDlgItem(w, kPrimary)), "pasted path enables Next");
                 click(w, kPrimary);
                 check(IsWindowVisible(GetDlgItem(w, kBack)), "source to destination");
                 check(ui.layout_valid(), "destination layout");
@@ -354,6 +414,7 @@ int wmain(int argc, wchar_t** argv) {
                     switch_language(w, selected);
                     check(IsWindowVisible(GetDlgItem(w, kReport)),
                           "verified result survives switch");
+                    check_links(w, true);
                     check(ui.layout_valid(), "compact result with language switch");
                     footer_aligned(w);
                 }

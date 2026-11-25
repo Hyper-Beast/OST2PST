@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <cwctype>
 #include <filesystem>
+#include <gdiplus.h>
 #include <iomanip>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -13,8 +14,48 @@
 
 namespace ost2pst::gui {
 namespace {
-constexpr COLORREF kBackground = RGB(244, 246, 249), kInk = RGB(28, 36, 50),
-                   kMuted = RGB(96, 108, 127), kAccent = RGB(40, 91, 215);
+constexpr COLORREF kBackground = RGB(245, 247, 251), kInk = RGB(27, 40, 60),
+                   kMuted = RGB(76, 92, 115), kAccent = RGB(39, 83, 194),
+                   kLine = RGB(214, 222, 234), kTint = RGB(240, 245, 255);
+constexpr wchar_t kGithubUrl[] = L"https://github.com/Hyper-Beast/OST2PST";
+constexpr wchar_t kCoffeeUrl[] = L"https://ko-fi.com/hyperbeast";
+constexpr COLORREF kMetricFill = RGB(247, 249, 253);
+int content_y(int height, int offset) {
+    return height < 560 ? 95 + MulDiv(offset, 78, 100) : 112 + offset;
+}
+RECT metric_box(int width, int height, int step, int column) {
+    const int col = (width - 128 + 12) / 3;
+    const int x = 64 + column * col;
+    const int y = step == 3 ? 129 : 210;
+    return {x, content_y(height, y), x + col - 12, content_y(height, y + 87)};
+}
+std::wstring link_start(const wchar_t* url) {
+    return std::wstring(L"<a href=\"") + url + L"\">";
+}
+// The caller saves/restores the DC around a group of shapes.
+void panel(HDC dc, RECT box, int radius, COLORREF fill, COLORREF edge) {
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCBrushColor(dc, fill);
+    SetDCPenColor(dc, edge);
+    RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
+}
+// Render the outline and fill in device pixels; leave the number to native text rendering.
+bool step_circle(HDC dc, const RECT& box, float border, COLORREF fill, COLORREF edge) {
+    Gdiplus::Graphics g(dc);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    auto disc = [&](float inset, COLORREF rgb) {
+        Gdiplus::Color color;
+        color.SetFromCOLORREF(rgb);
+        Gdiplus::SolidBrush brush(color);
+        const float size = static_cast<float>(box.right - box.left) - 2 * inset;
+        return g.FillEllipse(&brush, static_cast<float>(box.left) + inset,
+                             static_cast<float>(box.top) + inset, size, size) == Gdiplus::Ok;
+    };
+    return disc(0, edge) && (fill == edge || disc(border, fill));
+}
 std::wstring text(HWND w) {
     const int size = GetWindowTextLengthW(w);
     std::wstring s(static_cast<size_t>(size) + 1, L'\0');
@@ -42,7 +83,11 @@ std::wstring absolute(const std::wstring& s) {
 }
 std::wstring byte_size(uint64_t bytes) {
     std::wostringstream out;
-    if (bytes >= 1024 * 1024 * 1024)
+    if (bytes < 1024)
+        out << bytes << L" B";
+    else if (bytes < 1024 * 1024)
+        out << std::fixed << std::setprecision(1) << double(bytes) / 1024 << L" KiB";
+    else if (bytes >= 1024 * 1024 * 1024)
         out << std::fixed << std::setprecision(2) << double(bytes) / (1024 * 1024 * 1024)
             << L" GiB";
     else
@@ -111,7 +156,9 @@ LRESULT CALLBACK detail_proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
 Wizard::Wizard(Strings strings, UINT test_dpi, bool test_high_contrast)
     : strings_(std::move(strings)), test_dpi_(test_dpi), test_high_contrast_(test_high_contrast) {}
 Wizard::~Wizard() {
-    for (auto font : {body_font_, title_font_, small_font_, value_font_})
+    if (gdiplus_token_)
+        Gdiplus::GdiplusShutdown(gdiplus_token_);
+    for (auto font : {body_font_, title_font_, small_font_, value_font_, emphasis_font_})
         if (font)
             DeleteObject(font);
     if (white_)
@@ -123,6 +170,10 @@ int Wizard::px(int value) const {
     return MulDiv(value, static_cast<int>(dpi_), 96);
 }
 bool Wizard::create(HINSTANCE instance, int show) {
+    Gdiplus::GdiplusStartupInput graphics_settings;
+    if (!gdiplus_token_ &&
+        Gdiplus::GdiplusStartup(&gdiplus_token_, &graphics_settings, nullptr) != Gdiplus::Ok)
+        gdiplus_token_ = 0;
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = procedure;
     wc.hInstance = instance;
@@ -161,24 +212,33 @@ void Wizard::fonts() {
         DeleteObject(background_);
     white_ = CreateSolidBrush(high_contrast_ ? GetSysColor(COLOR_WINDOW) : RGB(255, 255, 255));
     background_ = CreateSolidBrush(high_contrast_ ? GetSysColor(COLOR_WINDOW) : kBackground);
-    for (auto* pair : {&body_font_, &title_font_, &small_font_, &value_font_})
+    for (auto* pair : {&body_font_, &title_font_, &small_font_, &value_font_, &emphasis_font_})
         if (*pair) {
             DeleteObject(*pair);
             *pair = nullptr;
         }
+    const auto locale = strings_.locale();
+    const auto* face = locale == "zh-Hans"   ? L"Microsoft YaHei UI"
+                       : locale == "zh-Hant" ? L"Microsoft JhengHei UI"
+                       : locale == "ja"      ? L"Yu Gothic UI"
+                       : locale == "ko"      ? L"Malgun Gothic"
+                                             : L"Segoe UI";
     auto make = [&](int size, int weight) {
         return CreateFontW(-MulDiv(size, static_cast<int>(dpi_), 72), 0, 0, 0, weight, FALSE, FALSE,
                            FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                           CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+                           CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
     };
     body_font_ = make(11, FW_NORMAL);
-    title_font_ = make(23, FW_SEMIBOLD);
+    title_font_ = make(22, FW_SEMIBOLD);
     small_font_ = make(10, FW_NORMAL);
     value_font_ = make(20, FW_SEMIBOLD);
+    emphasis_font_ = make(13, FW_SEMIBOLD);
     for (HWND child = GetWindow(window_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(body_font_), FALSE);
     if (heading_)
         SendMessageW(heading_, WM_SETFONT, reinterpret_cast<WPARAM>(title_font_), FALSE);
+    for (HWND h : {github_, coffee_, language_label_})
+        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small_font_), FALSE);
     for (auto h : stat_labels_)
         if (h)
             SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small_font_), FALSE);
@@ -194,10 +254,11 @@ void Wizard::build_controls() {
                                GetModuleHandleW(nullptr), nullptr);
     };
     heading_ = control(L"STATIC", L"", SS_LEFT);
+    intro_ = control(L"STATIC", L"", SS_LEFT);
     label_ = control(L"STATIC", L"", SS_LEFT);
+    browse_ = control(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, kBrowse);
     path_ = control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kPath, WS_EX_CLIENTEDGE);
     SendMessageW(path_, EM_SETLIMITTEXT, 32760, 0);
-    browse_ = control(L"BUTTON", strings_.get(Text::browse), WS_TABSTOP | BS_PUSHBUTTON, kBrowse);
     location_ = control(L"STATIC", L"", SS_PATHELLIPSIS);
     note_ = control(L"STATIC", L"", SS_LEFT);
     phase_ = control(L"STATIC", L"", SS_LEFT);
@@ -213,16 +274,20 @@ void Wizard::build_controls() {
                                   SS_LEFT);
         stat_values_[i] = control(L"STATIC", L"0", SS_LEFT);
     }
-    back_ = control(L"BUTTON", strings_.get(Text::back), WS_TABSTOP | BS_PUSHBUTTON, kBack);
+    back_ = control(L"BUTTON", strings_.get(Text::back), WS_TABSTOP | BS_OWNERDRAW, kBack);
     primary_ = control(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, kPrimary);
-    close_ = control(L"BUTTON", strings_.get(Text::close), WS_TABSTOP | BS_PUSHBUTTON, kClose);
-    details_ =
-        control(L"BUTTON", strings_.get(Text::details), WS_TABSTOP | BS_PUSHBUTTON, kDetails);
-    report_ = control(L"BUTTON", strings_.get(Text::report), WS_TABSTOP | BS_PUSHBUTTON, kReport);
-    folder_ = control(L"BUTTON", strings_.get(Text::folder), WS_TABSTOP | BS_PUSHBUTTON, kFolder);
-    resume_ = control(L"BUTTON", strings_.get(Text::resume), WS_TABSTOP | BS_PUSHBUTTON, kResume);
+    close_ = control(L"BUTTON", strings_.get(Text::close), WS_TABSTOP | BS_OWNERDRAW, kClose);
+    details_ = control(L"BUTTON", strings_.get(Text::details), WS_TABSTOP | BS_OWNERDRAW, kDetails);
+    report_ = control(L"BUTTON", strings_.get(Text::report), WS_TABSTOP | BS_OWNERDRAW, kReport);
+    folder_ = control(L"BUTTON", strings_.get(Text::folder), WS_TABSTOP | BS_OWNERDRAW, kFolder);
+    resume_ = control(L"BUTTON", strings_.get(Text::resume), WS_TABSTOP | BS_OWNERDRAW, kResume);
     language_label_ = control(L"STATIC", strings_.get(Text::language), SS_RIGHT);
     language_ = control(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, kLanguage);
+    INITCOMMONCONTROLSEX links{sizeof(links), ICC_LINK_CLASS};
+    InitCommonControlsEx(&links);
+    github_ = control(WC_LINK, link_start(kGithubUrl) + L"GitHub ↗</a>",
+                      WS_TABSTOP | LWS_TRANSPARENT | LWS_NOPREFIX, kGithub);
+    coffee_ = control(WC_LINK, L"", WS_TABSTOP | LWS_TRANSPARENT | LWS_NOPREFIX, kCoffee);
     for (size_t i = 0; i < std::size(kCatalogs); ++i) {
         const auto& catalog = kCatalogs[i];
         SendMessageW(language_, CB_ADDSTRING, 0,
@@ -243,28 +308,40 @@ void Wizard::layout() {
         MoveWindow(w, px(x), px(y), px(cx), px(cy), TRUE);
     };
     const int left = 64, right = width - 64, content = right - left;
+    place(github_, 180, 25, 72, 23);
     place(language_label_, width - 358, 29, 140, 24);
     place(language_, width - 208, 22, 176, 300);
     const bool compact = height < 560;
-    const int top = compact ? 96 : 124;
-    const auto y = [&](int offset) { return top + (compact ? MulDiv(offset, 78, 100) : offset); };
-    place(heading_, left, y(27), content, 48);
-    place(label_, left, y(step_ == 1 ? 130 : 100), content, 24);
+    const auto y = [&](int offset) { return content_y(height, offset); };
+    const bool complete = step_ == 3 && snapshot_.verdict == Verdict::kComplete;
+    const int heading_inset = complete ? 52 : 0;
+    place(heading_, left + heading_inset, y(22), content - heading_inset, 44);
+    place(intro_, left, y(82), content, 24);
+    place(label_, left, y(step_ == 1 ? 130 : 250), content, 24);
     const int browse_width = 160;
-    place(path_, left, y(step_ == 1 ? 164 : 134), content - browse_width - 12, 40);
-    place(browse_, right - browse_width, y(step_ == 1 ? 164 : 134), browse_width, 40);
+    if (step_ == 0) {
+        place(browse_, left, y(116), content, compact ? 86 : 110);
+        place(path_, left, y(282), content, compact ? 30 : 36);
+        SendMessageW(path_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(px(8), px(8)));
+    } else {
+        place(path_, left, y(164), content - browse_width - 12, 40);
+        place(browse_, right - browse_width, y(164), browse_width, 40);
+    }
     place(location_, left, y(compact ? 91 : 84), content, 24);
-    place(note_, left, y(step_ == 1 ? 226 : 196), content, 76);
+    place(note_, left, y(step_ == 1 ? 226 : 332), content, step_ == 0 ? 24 : 76);
     if (step_ == 3)
-        place(note_, left, y(241), content, compact ? 56 : 72);
+        place(note_, left, y(241), content, complete ? 28 : compact ? 56 : 72);
+    place(coffee_, left, height - 135, content, 30);
     place(phase_, left, y(97), content, 28);
     place(progress_, left, y(141), content, 8);
     place(processed_, left, y(166), content, 24);
     place(elapsed_, left, y(308), content, 26);
     for (int i = 0; i < 3; ++i) {
-        int col = content / 3;
-        place(stat_labels_[i], left + i * col, y(step_ == 3 ? 145 : 229), col - 16, 24);
-        place(stat_values_[i], left + i * col, y(step_ == 3 ? 177 : 261), col - 16, 36);
+        const RECT box = metric_box(width, height, step_, i);
+        const int x = box.left + 16, cx = box.right - x - 12;
+        place(stat_labels_[i], x, box.top + (compact ? 6 : 12), cx, 22);
+        place(stat_values_[i], x, box.bottom - (compact ? 38 : 45), cx, 36);
     }
     const int bottom = height - 65;
     // Measure localized action labels, sharing remaining space without hardcoded English widths.
@@ -305,9 +382,15 @@ void Wizard::page(bool focus) {
     show(heading_, true);
     show(language_, true);
     show(language_label_, true);
+    show(github_, true);
+    show(intro_, step_ == 0);
+    caption(intro_, strings_.get(Text::source_intro));
+    const bool complete = step_ == 3 && snapshot_.verdict == Verdict::kComplete;
+    show(coffee_, complete);
+    if (complete)
+        caption(coffee_, strings_.format(Text::coffee, link_start(kCoffeeUrl), L"</a>"));
     caption(language_label_, strings_.get(Text::language));
-    for (const auto& pair : {std::pair{browse_, Text::browse},
-                             {back_, Text::back},
+    for (const auto& pair : {std::pair{back_, Text::back},
                              {close_, Text::close},
                              {details_, Text::details},
                              {report_, Text::report},
@@ -345,7 +428,12 @@ void Wizard::page(bool focus) {
         caption(heading_, strings_.get(step_ == 0 ? Text::source_title : Text::destination_title));
         caption(label_, strings_.get(step_ == 0 ? Text::source_label : Text::destination_label));
         caption(path_, step_ == 0 ? source_ : output_);
-        caption(location_, source_);
+        const auto hint = step_ == 0 ? strings_.get(Text::path_hint) : std::wstring{};
+        SendMessageW(path_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(hint.c_str()));
+        caption(browse_, strings_.get(step_ == 1 ? Text::browse
+                                                 : (source_.empty() ? Text::choose_file
+                                                                    : Text::change_file)));
+        caption(location_, strings_.get(Text::source) + L"   ·   " + source_);
         caption(note_, L"");
         note_key_ = Text::kSize;
     }
@@ -357,14 +445,16 @@ void Wizard::page(bool focus) {
                                       : Text::another));
     if (step_ == 1 && exists(output_ + L".work"))
         set_note(Text::recovery);
-    EnableWindow(primary_, !stopping_);
+    EnableWindow(primary_, !stopping_ && (step_ != 0 || GetWindowTextLengthW(path_) != 0));
     EnableWindow(close_, !closing_);
     if (step_ == 2)
         caption(heading_, strings_.get(Text::conversion_title));
     render_state();
     layout();
     if (focus)
-        SetFocus(step_ < 2 ? path_ : primary_);
+        SetFocus(step_ == 0   ? (source_.empty() ? browse_ : primary_)
+                 : step_ == 1 ? path_
+                              : primary_);
 }
 void Wizard::change_language() {
     auto index = SendMessageW(language_, CB_GETCURSEL, 0, 0);
@@ -376,6 +466,7 @@ void Wizard::change_language() {
         output_ = text(path_);
     const auto note = note_key_;
     strings_ = Strings({from_utf8(std::string(kCatalogs[index].locale))});
+    fonts();
     page(false);
     if (step_ < 2 && note != Text::kSize)
         set_note(note);
@@ -437,6 +528,17 @@ bool Wizard::validate_destination(bool& resume) {
     }
     return true;
 }
+void Wizard::select_source(const std::wstring& path) {
+    // Only probe a file explicitly picked/dropped, never probe disk per keystroke.
+    picked_path_ = path;
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    picked_size_.clear();
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data) &&
+        !(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        picked_size_ = byte_size((uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow);
+    caption(path_, path);
+    SetFocus(primary_);
+}
 void Wizard::browse() {
     IFileDialog* dialog = nullptr;
     HRESULT hr = CoCreateInstance(step_ == 0 ? CLSID_FileOpenDialog : CLSID_FileSaveDialog, nullptr,
@@ -465,7 +567,10 @@ void Wizard::browse() {
         if (SUCCEEDED(dialog->GetResult(&item))) {
             PWSTR path = nullptr;
             if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-                caption(path_, path);
+                if (step_ == 0)
+                    select_source(path);
+                else
+                    caption(path_, path);
                 CoTaskMemFree(path);
                 caption(note_, L"");
                 note_key_ = Text::kSize;
@@ -625,6 +730,8 @@ void Wizard::command(int id) {
         } else if (step_ == 3) {
             source_.clear();
             output_.clear();
+            picked_path_.clear();
+            picked_size_.clear();
             step_ = 0;
             page();
         }
@@ -640,11 +747,11 @@ void Wizard::command(int id) {
     else if (id == kFolder && step_ == 3)
         open_path(std::filesystem::path(output_).parent_path().wstring());
 }
-void Wizard::open_path(const std::wstring& path) {
+void Wizard::open_path(const std::wstring& path, Text on_error) {
     if (reinterpret_cast<INT_PTR>(
             ShellExecuteW(window_, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
-        MessageBoxW(window_, strings_.get(Text::open_error).c_str(),
-                    strings_.get(Text::app).c_str(), MB_OK | MB_ICONERROR);
+        MessageBoxW(window_, strings_.get(on_error).c_str(), strings_.get(Text::app).c_str(),
+                    MB_OK | MB_ICONERROR);
 }
 void Wizard::show_details() {
     DetailState state;
@@ -696,22 +803,30 @@ void Wizard::show_details() {
     SetFocus(details_);
 }
 void Wizard::draw_button(const DRAWITEMSTRUCT& item) {
+    if (item.hwndItem == browse_ && step_ == 0) {
+        draw_source_picker(item);
+        return;
+    }
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-    COLORREF fill = high_contrast_ ? GetSysColor(disabled ? COLOR_BTNFACE : COLOR_HIGHLIGHT)
-                    : disabled     ? RGB(180, 192, 217)
-                    : (item.itemState & ODS_SELECTED) ? RGB(25, 65, 170)
-                                                      : kAccent;
-    auto brush = CreateSolidBrush(fill);
-    auto pen = CreatePen(PS_SOLID, 1, fill);
-    auto ob = SelectObject(item.hDC, brush), op = SelectObject(item.hDC, pen);
-    RoundRect(item.hDC, item.rcItem.left, item.rcItem.top, item.rcItem.right, item.rcItem.bottom,
-              px(8), px(8));
-    SelectObject(item.hDC, ob);
-    SelectObject(item.hDC, op);
-    DeleteObject(brush);
-    DeleteObject(pen);
+    const bool secondary = item.hwndItem != primary_;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const bool highlighted = !disabled && (!secondary || pressed);
+    const auto fill = high_contrast_ ? GetSysColor(highlighted ? COLOR_HIGHLIGHT : COLOR_WINDOW)
+                      : disabled     ? RGB(228, 233, 241)
+                      : secondary    ? (pressed ? kTint : RGB(255, 255, 255))
+                      : pressed      ? RGB(25, 65, 170)
+                                     : kAccent;
+    const auto saved = SaveDC(item.hDC);
+    FillRect(item.hDC, &item.rcItem, item.hwndItem == browse_ ? white_ : background_);
+    panel(item.hDC, item.rcItem, px(10), fill,
+          secondary ? (high_contrast_ ? GetSysColor(COLOR_WINDOWTEXT) : kLine) : fill);
     SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, high_contrast_ ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(255, 255, 255));
+    SetTextColor(item.hDC, high_contrast_ ? GetSysColor(disabled      ? COLOR_GRAYTEXT
+                                                        : highlighted ? COLOR_HIGHLIGHTTEXT
+                                                                      : COLOR_WINDOWTEXT)
+                           : disabled     ? kMuted
+                           : secondary    ? kInk
+                                          : RGB(255, 255, 255));
     SelectObject(item.hDC, body_font_);
     auto t = text(item.hwndItem);
     RECT r = item.rcItem;
@@ -720,6 +835,78 @@ void Wizard::draw_button(const DRAWITEMSTRUCT& item) {
         InflateRect(&r, -px(4), -px(4));
         DrawFocusRect(item.hDC, &r);
     }
+    RestoreDC(item.hDC, saved);
+}
+void Wizard::draw_source_picker(const DRAWITEMSTRUCT& item) {
+    const HDC dc = item.hDC;
+    const int saved = SaveDC(dc);
+    const RECT r = item.rcItem;
+    const int mid = (r.top + r.bottom) / 2;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const auto paper = high_contrast_ ? GetSysColor(COLOR_WINDOW) : RGB(255, 255, 255);
+    const auto ink = high_contrast_ ? GetSysColor(COLOR_WINDOWTEXT) : kInk;
+    const auto accent = high_contrast_ ? GetSysColor(COLOR_HIGHLIGHT) : kAccent;
+    FillRect(dc, &r, white_);
+    panel(dc, r, px(18),
+          high_contrast_ ? paper
+          : pressed      ? RGB(227, 237, 255)
+                         : kTint,
+          high_contrast_ ? ink : RGB(188, 206, 242));
+    // A stacked envelope, drawn in logical pixels. No image assets or icon font.
+    const int x = px(22);
+    panel(dc, {x, mid - px(28), x + px(56), mid + px(28)}, px(14), paper,
+          high_contrast_ ? ink : kLine);
+    panel(dc, {x + px(18), mid - px(13), x + px(39), mid + px(6)}, px(4),
+          high_contrast_ ? paper : RGB(217, 230, 255), accent);
+    panel(dc, {x + px(11), mid - px(6), x + px(43), mid + px(14)}, px(4), paper, accent);
+    POINT flap[] = {
+        {x + px(12), mid - px(5)}, {x + px(27), mid + px(5)}, {x + px(41), mid - px(5)}};
+    Polyline(dc, flap, 3);
+    SetBkMode(dc, TRANSPARENT);
+    SelectObject(dc, body_font_);
+    const auto action = text(browse_);
+    SIZE size{};
+    GetTextExtentPoint32W(dc, action.c_str(), static_cast<int>(action.size()), &size);
+    RECT button{r.right - px(20) - std::max(px(124), static_cast<int>(size.cx) + px(32)),
+                mid - px(19), r.right - px(20), mid + px(19)};
+    auto entered = text(path_);
+    bool empty = entered.empty();
+    const auto button_fill = empty || high_contrast_ ? accent : paper;
+    panel(dc, button, px(9), button_fill, empty || high_contrast_ ? accent : kLine);
+    SetTextColor(dc, high_contrast_ ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                     : empty        ? RGB(255, 255, 255)
+                                    : kAccent);
+    DrawTextW(dc, action.c_str(), -1, &button,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT name{x + px(72), mid - px(25), button.left - px(16), mid + px(3)};
+    auto title = empty ? strings_.get(Text::drop_title)
+                       : std::filesystem::path(entered).filename().wstring();
+    if (title.empty())
+        title = entered;
+    SetTextColor(dc, ink);
+    SelectObject(dc, emphasis_font_);
+    DrawTextW(dc, title.c_str(), -1, &name,
+              DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    RECT type{name.left, mid + px(4), name.right, mid + px(27)};
+    SelectObject(dc, small_font_);
+    SetTextColor(dc, high_contrast_ ? ink : kMuted);
+    std::wstring detail = L"Outlook  ·  .ost";
+    if (!empty && entered == picked_path_ && !picked_size_.empty())
+        detail += L"  ·  " + picked_size_;
+    DrawTextW(dc, detail.c_str(), -1, &type, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT)) {
+        RECT focus = button;
+        InflateRect(&focus, px(3), px(3));
+        if (high_contrast_)
+            DrawFocusRect(dc, &focus);
+        else {
+            SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            SelectObject(dc, GetStockObject(DC_PEN));
+            SetDCPenColor(dc, accent);
+            RoundRect(dc, focus.left, focus.top, focus.right, focus.bottom, px(11), px(11));
+        }
+    }
+    RestoreDC(dc, saved);
 }
 void Wizard::paint() {
     PAINTSTRUCT ps;
@@ -728,13 +915,46 @@ void Wizard::paint() {
     GetClientRect(window_, &r);
     FillRect(dc, &r, background_);
     const bool compact = MulDiv(r.bottom, 96, static_cast<int>(dpi_)) < 560;
-    RECT card{px(32), px(compact ? 96 : 124), r.right - px(32), r.bottom - px(88)};
-    FillRect(dc, &card, white_);
+    const int saved = SaveDC(dc);
+    const auto paper = high_contrast_ ? GetSysColor(COLOR_WINDOW) : RGB(255, 255, 255);
+    const auto ink = high_contrast_ ? GetSysColor(COLOR_WINDOWTEXT) : kInk;
+    RECT header{0, 0, r.right, px(56)};
+    FillRect(dc, &header, white_);
+    RECT card{px(32), px(compact ? 95 : 112), r.right - px(32), r.bottom - px(88)};
+    panel(dc, card, px(18), paper, high_contrast_ ? ink : kLine);
+    const int width = MulDiv(r.right, 96, static_cast<int>(dpi_));
+    const int height = MulDiv(r.bottom, 96, static_cast<int>(dpi_));
+    if (step_ >= 2) {
+        for (int i = 0; i < 3; ++i) {
+            const RECT box = metric_box(width, height, step_, i);
+            panel(dc, {px(box.left), px(box.top), px(box.right), px(box.bottom)}, px(12),
+                  high_contrast_ ? paper : kMetricFill, high_contrast_ ? ink : kLine);
+        }
+    }
+    if (step_ == 3 && snapshot_.verdict == Verdict::kComplete) {
+        const int top = px(content_y(height, 22) + 3);
+        const auto green = high_contrast_ ? ink : RGB(26, 112, 79);
+        const auto tint = high_contrast_ ? paper : RGB(229, 245, 235);
+        panel(dc, {px(64), top, px(102), top + px(38)}, px(38), tint, high_contrast_ ? ink : tint);
+        const auto pen = CreatePen(PS_SOLID, px(3), green);
+        const auto old = SelectObject(dc, pen);
+        POINT mark[] = {{px(74), top + px(19)}, {px(80), top + px(25)}, {px(92), top + px(12)}};
+        Polyline(dc, mark, 3);
+        SelectObject(dc, old);
+        DeleteObject(pen);
+        RECT rule{px(64), r.bottom - px(150), r.right - px(64), r.bottom - px(149)};
+        SetDCBrushColor(dc, high_contrast_ ? ink : kLine);
+        FillRect(dc, &rule, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    }
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, high_contrast_ ? GetSysColor(COLOR_WINDOWTEXT) : kInk);
-    SelectObject(dc, body_font_);
-    RECT brand{px(32), px(24), r.right - px(390), px(52)};
+    SetTextColor(dc, ink);
+    SelectObject(dc, emphasis_font_);
+    auto icon = reinterpret_cast<HICON>(GetClassLongPtrW(window_, GCLP_HICON));
+    DrawIconEx(dc, px(32), px(20), icon, px(30), px(30), 0, nullptr, DI_NORMAL);
+    RECT brand{px(72), px(20), px(157), px(50)};
     DrawTextW(dc, L"OST2PST", -1, &brand, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT divider{px(162), px(26), px(163), px(45)};
+    FillRect(dc, &divider, GetSysColorBrush(COLOR_3DSHADOW));
     SelectObject(dc, small_font_);
     const Text labels[] = {Text::source, Text::destination, Text::conversion, Text::result};
     const int col = (r.right - px(64)) / 4;
@@ -744,16 +964,32 @@ void Wizard::paint() {
                                : i == step_   ? kAccent
                                               : kMuted;
         SetTextColor(dc, color);
-        auto s = std::to_wstring(i + 1) + L"  " + strings_.get(labels[i]);
-        RECT label{left, px(compact ? 60 : 74), left + col - px(8), px(compact ? 85 : 99)};
+        const int top = px(compact ? 61 : 69);
+        const bool marked = i <= step_;
+        const auto marker = high_contrast_ ? GetSysColor(COLOR_HIGHLIGHT) : kAccent;
+        RECT number{left, top, left + px(23), top + px(23)};
+        const auto fill = marked ? marker : paper;
+        const auto edge = marked ? marker : (high_contrast_ ? ink : kLine);
+        if (!gdiplus_token_ || !step_circle(dc, number, dpi_ / 96.0f, fill, edge))
+            panel(dc, number, px(23), fill, edge);
+        SetTextColor(
+            dc, marked ? (high_contrast_ ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(255, 255, 255))
+                       : color);
+        const auto n = std::to_wstring(i + 1);
+        DrawTextW(dc, n.c_str(), -1, &number, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        SetTextColor(dc, color);
+        const auto s = strings_.get(labels[i]);
+        RECT label{left + px(32), top, left + col - px(8), top + px(23)};
         DrawTextW(dc, s.c_str(), -1, &label, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        RECT line{left, px(compact ? 88 : 108), left + col - px(10), px(compact ? 91 : 111)};
-        auto brush = CreateSolidBrush(i <= step_       ? color
-                                      : high_contrast_ ? GetSysColor(COLOR_GRAYTEXT)
-                                                       : RGB(220, 226, 235));
-        FillRect(dc, &line, brush);
-        DeleteObject(brush);
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, s.c_str(), static_cast<int>(s.size()), &extent);
+        RECT line{label.left + extent.cx + px(12), top + px(11), left + col - px(12), top + px(12)};
+        if (i != 3 && line.left < line.right) {
+            SetDCBrushColor(dc, high_contrast_ ? ink : kLine);
+            FillRect(dc, &line, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        }
     }
+    RestoreDC(dc, saved);
     EndPaint(window_, &ps);
 }
 bool Wizard::layout_valid() const {
@@ -772,6 +1008,13 @@ bool Wizard::layout_valid() const {
         if (r.left < 0 || r.top < 0 || r.right > client.right || r.bottom > client.bottom ||
             r.right <= r.left || r.bottom <= r.top)
             return false;
+        if (child == github_ || child == coffee_) {
+            SIZE ideal{};
+            if (!SendMessageW(child, LM_GETIDEALSIZE, r.right - r.left,
+                              reinterpret_cast<LPARAM>(&ideal)) ||
+                ideal.cy > r.bottom - r.top)
+                return false;
+        }
         wchar_t name[32];
         GetClassNameW(child, name, 32);
         if (std::wstring(name) == L"Button") {
@@ -799,7 +1042,8 @@ bool Wizard::layout_valid() const {
 LRESULT Wizard::message(UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case DM_GETDEFID:
-        return MAKELONG(kPrimary, DC_HASDEFID);
+        return MAKELONG(step_ == 0 && !GetWindowTextLengthW(path_) ? kBrowse : kPrimary,
+                        DC_HASDEFID);
     case DM_SETDEFID:
         return TRUE;
     case WM_CREATE:
@@ -834,7 +1078,12 @@ LRESULT Wizard::message(UINT m, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == kPath && HIWORD(wp) == EN_CHANGE && step_ < 2) {
             caption(note_, L"");
             note_key_ = Text::kSize;
-            if (step_ == 1) {
+            if (step_ == 0) {
+                const bool entered = GetWindowTextLengthW(path_) != 0;
+                EnableWindow(primary_, entered);
+                caption(browse_, strings_.get(entered ? Text::change_file : Text::choose_file));
+                InvalidateRect(browse_, nullptr, TRUE);
+            } else {
                 const auto value = absolute(text(path_));
                 const bool recovery = exists(value + L".work");
                 caption(primary_, strings_.get(recovery ? Text::resume : Text::start));
@@ -846,6 +1095,17 @@ LRESULT Wizard::message(UINT m, WPARAM wp, LPARAM lp) {
         else if (HIWORD(wp) == BN_CLICKED)
             command(LOWORD(wp));
         return 0;
+    case WM_NOTIFY: {
+        const auto* notice = reinterpret_cast<const NMHDR*>(lp);
+        if (notice->code == NM_CLICK || notice->code == NM_RETURN) {
+            if (notice->hwndFrom == github_)
+                open_path(kGithubUrl, Text::open_link_error);
+            else if (notice->hwndFrom == coffee_ && step_ == 3 &&
+                     snapshot_.verdict == Verdict::kComplete)
+                open_path(kCoffeeUrl, Text::open_link_error);
+        }
+        break;
+    }
     case WM_DROPFILES: {
         auto drop = reinterpret_cast<HDROP>(wp);
         if (step_ == 0 && DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) == 1) {
@@ -853,28 +1113,39 @@ LRESULT Wizard::message(UINT m, WPARAM wp, LPARAM lp) {
             std::wstring path(n + 1, L'\0');
             DragQueryFileW(drop, 0, path.data(), n + 1);
             path.resize(n);
-            caption(path_, path);
+            select_source(path);
         }
         DragFinish(drop);
         return 0;
     }
     case WM_DRAWITEM:
-        if (wp == kPrimary) {
+        if (reinterpret_cast<const DRAWITEMSTRUCT*>(lp)->CtlType == ODT_BUTTON) {
             draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lp));
+            return TRUE;
+        }
+        break;
+    case WM_SETCURSOR:
+        if (step_ == 0 && reinterpret_cast<HWND>(wp) == browse_ && LOWORD(lp) == HTCLIENT) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
         break;
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wp);
+        const HWND child = reinterpret_cast<HWND>(lp);
+        const bool value = std::find(std::begin(stat_values_), std::end(stat_values_), child) !=
+                           std::end(stat_values_);
+        const bool metric = value || std::find(std::begin(stat_labels_), std::end(stat_labels_),
+                                               child) != std::end(stat_labels_);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, high_contrast_ ? GetSysColor(COLOR_WINDOWTEXT)
-                         : reinterpret_cast<HWND>(lp) == heading_ ||
-                                 std::find(std::begin(stat_values_), std::end(stat_values_),
-                                           reinterpret_cast<HWND>(lp)) != std::end(stat_values_)
-                             ? kInk
-                             : kMuted);
-        return reinterpret_cast<LRESULT>(reinterpret_cast<HWND>(lp) == language_label_ ? background_
-                                                                                       : white_);
+        SetTextColor(dc, high_contrast_               ? GetSysColor(COLOR_WINDOWTEXT)
+                         : child == heading_ || value ? kInk
+                                                      : kMuted);
+        if (metric && !high_contrast_) {
+            SetDCBrushColor(dc, kMetricFill);
+            return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+        }
+        return reinterpret_cast<LRESULT>(white_);
     }
     case WM_ERASEBKGND:
         return 1;

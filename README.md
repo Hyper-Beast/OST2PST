@@ -1,14 +1,15 @@
+# OST2PST
+
+**[Get OST2PST on the Microsoft Store · 从 Microsoft Store 免费安装](https://apps.microsoft.com/detail/9PK80SGX7K82)**
+
+[English](#english) · [简体中文](#简体中文)
+
 ## ☕ Support
 
 If **OST2PST** rescued your emails or saved you from buying expensive commercial recovery tools, consider buying me a coffee!
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Me-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/hyperbeast)
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/KirinH93)
-
-
-# OST2PST
-
-[English](#english) · [简体中文](#简体中文)
 
 <a id="english"></a>
 ## English
@@ -22,13 +23,14 @@ Windows conversion wizard with source, destination, progress and result pages.
 
 ### Download and use the GUI
 
-1. Download **`OST2PST-Windows-x64.zip`** from this repository's **Releases** page.
-2. Extract the entire ZIP and double-click **`OST2PST.exe`**. Keep the `engine` folder beside it.
-3. Select your OST, choose a new PST destination, and start conversion. The wizard shows progress
-   and the final result; an incomplete result includes reports for inspection.
+OST2PST is completely free, with no limit on the number of conversions. Choose either download:
 
-The portable package requires Windows 10 1607+ x64 and needs no installation or separate
-.NET/VC++ runtime. Language follows Windows automatically (English fallback), with a selector
+- **[Microsoft Store](https://apps.microsoft.com/detail/9PK80SGX7K82)** — install on Windows 10 version 1809 or later (x64), then open **OST2PST** from Start.
+- **[Portable ZIP on GitHub Releases](https://github.com/Hyper-Beast/OST2PST/releases/latest)** — for Windows 10 version 1607 or later (x64). Extract the entire ZIP and run **`OST2PST.exe`** with the `engine` folder beside it.
+
+Select your OST, choose a new PST destination, and start conversion. The wizard shows progress and
+the final result; an incomplete result includes reports for inspection. Neither download requires a
+separate .NET or VC++ runtime installation. Language follows Windows automatically (English fallback), with a selector
 at the top. Stop preserves recovery data; use Resume with the same source and destination.
 Close Outlook before copying the OST, or use an immutable copy.
 
@@ -91,7 +93,8 @@ This package needs no separate .NET or VC++ runtime install. Windows 10 1607+ is
 its DPI APIs; native testing was on Windows 11 x64. The wizard converts files and opens reports,
 without a mail viewer. Item counts/progress are real; assembly/verification/publication show activity.
 Stop retains recovery files, and Resume validates the original source and worker identities.
-Packaging refuses an existing folder/ZIP. No signing or installer is included.
+The portable packaging script refuses an existing folder/ZIP. For the Store MSIX, see the
+[Store build instructions](store/README.md). See also the [privacy policy](PRIVACY.md).
 
 ### CLI usage
 
@@ -275,13 +278,15 @@ M1–M7 转换器里程碑已完成；本版本包含 CLI 和原生 Windows 四�
 
 ### 下载与图形界面使用
 
-1. 在本项目的 **Releases** 页面下载 **`OST2PST-Windows-x64.zip`**。
-2. **完整解压**后双击 **`OST2PST.exe`**，保留旁边的 `engine` 文件夹。
-3. 选择 OST 文件和新的 PST 保存位置，开始转换。界面显示进度和最终结果；结果不完整时可查看报告。
+OST2PST **完全免费，转换不限次数**。可选择任一方式：
 
-便携包需要 Windows 10 1607+ x64，无需安装或另装 .NET/VC++ 运行库。界面默认跟随系统语言，
-不支持时显示英文，也可在顶部切换。停止会保留恢复数据，使用相同源文件和目标位置可继续。
+- **[从 Microsoft Store 安装](https://apps.microsoft.com/detail/9PK80SGX7K82)**：适用于 Windows 10 1809 或更高版本（x64），安装后从开始菜单打开 **OST2PST**。
+- **[从 GitHub Releases 下载便携 ZIP](https://github.com/Hyper-Beast/OST2PST/releases/latest)**：适用于 Windows 10 1607 或更高版本（x64）。完整解压后双击 **`OST2PST.exe`**，保留旁边的 `engine` 文件夹。
+
+选择 OST 文件和新的 PST 保存位置即可开始转换；结果不完整时可查看报告。两种版本均无需另装 .NET 或 VC++ 运行库。
+界面默认跟随系统语言，不支持时显示英文，也可在顶部切换。停止会保留恢复数据，使用相同源文件和目标位置可继续。
 复制 OST 前请退出 Outlook，或使用不会再变化的副本。
+商店版源码打包方法见[MSIX 构建说明](store/README.md)，数据处理方式见[隐私政策](PRIVACY.md)。
 
 ### 功能与范围
 

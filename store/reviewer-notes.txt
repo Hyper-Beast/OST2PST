@@ -1,0 +1,24 @@
+App: OST2PST (x64 desktop utility). No account, network connection, Microsoft Outlook
+installation, purchase or subscription is required for conversion.
+
+Sample: provide the accompanying OST2PST-synthetic-review.zip to the reviewer via
+an accessible attachment or download link. It is generated test data in a supported
+Unicode format, not an Outlook user's mailbox. Extract Example.ost to a writable folder.
+
+1. Open OST2PST from Start. Select Example.ost and click Next.
+2. Choose a new output file (e.g. Example.pst) in a writable local folder. Start conversion.
+3. Expect "Conversion complete", 3 messages, 0 skipped/failed. The PST and its
+   .report.json and .items.jsonl files are saved beside one another. Use a new name
+   for another run: existing files are intentionally not overwritten.
+
+Restricted capability: runFullTrust. OST2PST is a classic Win32 desktop wizard.
+It launches only its bundled conversion engine (engine/ost2pst.exe) for conversion
+and runs at the current user's privilege level. It needs to read the user-selected
+mailbox and write a PST, sidecar reports and temporary/recovery files. It does not
+need administrator rights, a service or mailbox credentials.
+
+External links: GitHub opens the project page. After a verified complete conversion,
+an optional link opens https://ko-fi.com/hyperbeast in the user's default browser.
+This is voluntary support handled by Ko-fi and its payment provider. No features,
+content or services in the app are exchanged for a tip; the app does not handle
+payment details. Neither website opens automatically.
